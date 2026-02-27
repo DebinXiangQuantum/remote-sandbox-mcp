@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import os
 import posixpath
@@ -10,12 +11,24 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import paramiko
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("remote-sandbox")
+
+
+def _safe_tool(fn: Callable) -> Callable:
+    """Decorator: catch any unhandled exception from a tool and return it as
+    {"error": "..."} so MCP always gets a valid JSON response."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+    return wrapper
 
 
 DEFAULT_EXCLUDES = [
@@ -270,13 +283,15 @@ class SandboxSession:
 _SESSIONS: dict[str, SandboxSession] = {}
 _ACTIVE_SANDBOX: Optional[str] = None
 _REGISTRY_LOCK = threading.Lock()
+_INIT_ERROR: Optional[str] = None  # surface config errors to tool callers
 
 
 def _init_sessions() -> None:
-    global _ACTIVE_SANDBOX
+    global _ACTIVE_SANDBOX, _INIT_ERROR
     try:
         configs = _load_sandbox_configs()
-    except Exception:
+    except Exception as exc:
+        _INIT_ERROR = str(exc)
         configs = []
     with _REGISTRY_LOCK:
         for cfg in configs:
@@ -289,6 +304,8 @@ _init_sessions()
 
 
 def _get_session(sandbox_name: str = "") -> SandboxSession:
+    if _INIT_ERROR:
+        raise ValueError(f"Sandbox configuration error: {_INIT_ERROR}")
     name = sandbox_name.strip() or _ACTIVE_SANDBOX
     if not name:
         raise ValueError(
@@ -844,6 +861,7 @@ def _single_file_candidates(path_arg: str, abs_path: Path) -> list[str]:
 
 
 @mcp.tool()
+@_safe_tool
 def list_sandboxes(check_resources: bool = False) -> dict:
     """List all configured sandboxes with connection info.
 
@@ -853,6 +871,15 @@ def list_sandboxes(check_resources: bool = False) -> dict:
     """
     with _REGISTRY_LOCK:
         sessions = dict(_SESSIONS)
+    if _INIT_ERROR:
+        return {
+            "error": f"Sandbox configuration error: {_INIT_ERROR}",
+            "hint": (
+                "Check REMOTE_SANDBOX_LIST is valid JSON and contains host/user "
+                "and password or key_file for each sandbox."
+            ),
+            "sandboxes": [],
+        }
     if not sessions:
         return {
             "error": (
@@ -878,6 +905,7 @@ def list_sandboxes(check_resources: bool = False) -> dict:
 
 
 @mcp.tool()
+@_safe_tool
 def select_sandbox(sandbox_name: str) -> dict:
     """Set the active sandbox for all subsequent tool calls in this session.
 
@@ -896,12 +924,15 @@ def select_sandbox(sandbox_name: str) -> dict:
 
 
 @mcp.tool()
+@_safe_tool
 def get_active_sandbox() -> dict:
     """Return the currently active sandbox and its live connection health.
 
     Use this to verify the session is still connected before running a long task.
     If connection_alive is False, the next tool call will auto-reconnect.
     """
+    if _INIT_ERROR:
+        return {"active_sandbox": None, "error": f"Sandbox configuration error: {_INIT_ERROR}"}
     if not _ACTIVE_SANDBOX:
         return {"active_sandbox": None, "error": "No active sandbox configured"}
     with _REGISTRY_LOCK:
@@ -923,6 +954,7 @@ def get_active_sandbox() -> dict:
 
 
 @mcp.tool()
+@_safe_tool
 def exec_bash(
     command: str,
     cwd: str | None = None,
@@ -954,6 +986,7 @@ def exec_bash(
 
 
 @mcp.tool()
+@_safe_tool
 def exec_bash_background(
     command: str,
     session_name: str = "",
@@ -1071,6 +1104,7 @@ def exec_bash_background(
 
 
 @mcp.tool()
+@_safe_tool
 def check_background_task(
     tmux_session: str,
     log_file: str = "",
@@ -1138,6 +1172,7 @@ def check_background_task(
 
 
 @mcp.tool()
+@_safe_tool
 def list_remote_files(
     remote_path: str = ".",
     recursive: bool = False,
@@ -1188,6 +1223,7 @@ def list_remote_files(
 
 
 @mcp.tool()
+@_safe_tool
 def read_remote_file(
     remote_path: str,
     max_bytes: int = 200000,
@@ -1220,6 +1256,7 @@ def read_remote_file(
 
 
 @mcp.tool()
+@_safe_tool
 def sync_local_to_remote(
     local_path: str = ".",
     remote_path: str = ".",
@@ -1324,6 +1361,7 @@ def sync_local_to_remote(
 
 
 @mcp.tool()
+@_safe_tool
 def sync_remote_to_local(
     remote_path: str = ".",
     local_path: str = "./remote_mirror",
