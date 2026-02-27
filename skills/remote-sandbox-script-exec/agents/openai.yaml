@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Sandbox Exec"
+  short_description: "Run tasks in SSH sandbox with uv and synced logs"
+  default_prompt: "Use $remote-sandbox-script-exec to run this task in the SSH sandbox: setup uv, sync code, execute with tee logs, and inspect outputs."

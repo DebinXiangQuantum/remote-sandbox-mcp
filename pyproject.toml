@@ -1,0 +1,37 @@
+[project]
+name = "remote-sandbox-mcp"
+version = "0.3.0"
+description = "MCP server for SSH-based remote sandboxes: multi-server management, persistent sessions, background tmux tasks, and GPU/CPU/memory resource monitoring"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+  { name = "xiangdebin" }
+]
+keywords = ["mcp", "ssh", "sandbox", "remote", "claude", "ai", "tmux", "gpu"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = [
+  "mcp>=1.12.0",
+  "paramiko>=3.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/xiangdebin/remote-sandbox-mcp"
+Repository = "https://github.com/xiangdebin/remote-sandbox-mcp"
+Issues = "https://github.com/xiangdebin/remote-sandbox-mcp/issues"
+
+[project.scripts]
+remote-sandbox-mcp = "remote_sandbox_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
