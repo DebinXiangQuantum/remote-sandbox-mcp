@@ -105,7 +105,13 @@ def _load_sandbox_configs() -> list[SandboxConfig]:
         try:
             items = json.loads(sandbox_list_json)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"REMOTE_SANDBOX_LIST is not valid JSON: {exc}") from exc
+            # Show the raw bytes around the bad position so it's diagnosable
+            pos = exc.pos if exc.pos is not None else 0
+            snippet = repr(sandbox_list_json[max(0, pos - 5): pos + 10])
+            raise ValueError(
+                f"REMOTE_SANDBOX_LIST is not valid JSON: {exc}. "
+                f"Raw bytes around error position {pos}: {snippet}"
+            ) from exc
         if not isinstance(items, list):
             raise ValueError("REMOTE_SANDBOX_LIST must be a JSON array")
         configs: list[SandboxConfig] = []
@@ -871,6 +877,17 @@ def list_sandboxes(check_resources: bool = False) -> dict:
     """
     with _REGISTRY_LOCK:
         sessions = dict(_SESSIONS)
+
+    # Always include diagnostic info so the caller can see what went wrong
+    env_sandbox_list = os.environ.get("REMOTE_SANDBOX_LIST", "")
+    env_host = os.environ.get("REMOTE_HOST", "")
+    diagnostics = {
+        "REMOTE_SANDBOX_LIST_set": bool(env_sandbox_list),
+        "REMOTE_SANDBOX_LIST_length": len(env_sandbox_list),
+        "REMOTE_HOST_set": bool(env_host),
+        "init_error": _INIT_ERROR,
+    }
+
     if _INIT_ERROR:
         return {
             "error": f"Sandbox configuration error: {_INIT_ERROR}",
@@ -878,6 +895,7 @@ def list_sandboxes(check_resources: bool = False) -> dict:
                 "Check REMOTE_SANDBOX_LIST is valid JSON and contains host/user "
                 "and password or key_file for each sandbox."
             ),
+            "diagnostics": diagnostics,
             "sandboxes": [],
         }
     if not sessions:
@@ -886,6 +904,7 @@ def list_sandboxes(check_resources: bool = False) -> dict:
                 "No sandboxes configured. "
                 "Set REMOTE_HOST/REMOTE_USER/REMOTE_PASSWORD or REMOTE_SANDBOX_LIST."
             ),
+            "diagnostics": diagnostics,
             "sandboxes": [],
         }
     sandboxes = []

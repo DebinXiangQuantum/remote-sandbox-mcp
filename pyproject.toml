@@ -1,6 +1,6 @@
 [project]
 name = "remote-sandbox-mcp"
-version = "0.3.2"
+version = "0.3.6"
 description = "MCP server for SSH-based remote sandboxes: multi-server management, persistent sessions, background tmux tasks, and GPU/CPU/memory resource monitoring"
 readme = "README.md"
 license = "MIT"
