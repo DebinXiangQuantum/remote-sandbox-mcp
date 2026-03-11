@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import argparse
 import fnmatch
 import functools
 import json
 import os
 import posixpath
+import shutil
 import shlex
 import stat
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -15,6 +18,29 @@ from typing import Callable, Iterable, Optional
 
 import paramiko
 from mcp.server.fastmcp import FastMCP
+from remote_sandbox_mcp.watchdog_daemon import WatchdogDaemon
+from remote_sandbox_mcp.watchdog_service import (
+    get_launch_agent_status,
+    install_launch_agent,
+    uninstall_launch_agent,
+)
+from remote_sandbox_mcp.watchdog_store import (
+    DEFAULT_ALERT_AFTER_FAILURES,
+    DEFAULT_MAX_LOG_LINES,
+    DEFAULT_RESUME_DELAY_S,
+    DEFAULT_WATCH_INTERVAL_S,
+    HEARTBEAT_STALE_S,
+    config_path as watchdog_config_path,
+    create_watch,
+    db_path as watchdog_db_path,
+    get_daemon_meta,
+    get_watch,
+    init_db as init_watchdog_db,
+    list_events as list_watchdog_events,
+    list_watches as list_watchdog_watches,
+    save_sandbox_config,
+    cancel_watch as cancel_watchdog_watch,
+)
 
 mcp = FastMCP("remote-sandbox")
 
@@ -1012,14 +1038,35 @@ def exec_bash_background(
     log_file: str = "",
     cwd: str = "",
     sandbox_name: str = "",
+    watch: bool = True,
+    ensure_watchdog: bool = True,
+    run_id: str = "",
+    watch_name: str = "",
+    resume_command: str = "",
+    resume_plan_json: str = "",
+    checkpoint_path: str = "",
+    checkpoint_format: str = "text",
+    checkpoint_command: str = "",
+    interval_s: int = DEFAULT_WATCH_INTERVAL_S,
+    max_log_lines: int = DEFAULT_MAX_LOG_LINES,
+    webhook_url: str = "",
+    event_command: str = "",
+    auto_resume: bool = False,
+    max_resume_attempts: int = 1,
+    metadata_json: str = "",
+    notify_local: bool = True,
+    alert_after_failures: int = DEFAULT_ALERT_AFTER_FAILURES,
+    resume_delay_s: int = DEFAULT_RESUME_DELAY_S,
+    codex_wakeup: bool = False,
+    codex_command: str = "",
 ) -> dict:
     """Start a long-running command in a detached tmux session on the remote sandbox.
 
     Output (stdout + stderr) is streamed via ``tee`` into *log_file* for async
     inspection. An EXIT_CODE=<n> line is appended to the log when the command ends.
 
-    Returns immediately with the tmux session name and log path.
-    Use check_background_task to poll progress and read recent log output.
+    On macOS, this also auto-registers a local watchdog watch by default and
+    returns the resulting watch id for later polling.
 
     Recommended for: training jobs, long builds, batch pipelines, anything that
     would exceed exec_bash's timeout or that you want to check on periodically.
@@ -1031,20 +1078,31 @@ def exec_bash_background(
                   .codex_logs/<session_name>.log relative to cwd.
         cwd: Working directory on the remote host.
         sandbox_name: Override the active sandbox for this call (optional).
+        watch: Whether to register a watchdog watch and return watch_id.
     """
     if not command.strip():
         raise ValueError("command cannot be empty")
+    if interval_s <= 0:
+        raise ValueError("interval_s must be positive")
+    if max_log_lines <= 0:
+        raise ValueError("max_log_lines must be positive")
+    if max_resume_attempts < 0:
+        raise ValueError("max_resume_attempts must be zero or positive")
+    if alert_after_failures < 1:
+        raise ValueError("alert_after_failures must be positive")
+    if resume_delay_s < 0:
+        raise ValueError("resume_delay_s must be zero or positive")
 
     session = _get_session(sandbox_name)
     client = session.ensure_connected()
 
-    run_id = session_name.strip() or f"bg-{int(time.time())}"
+    tmux_session_name = session_name.strip() or f"bg-{int(time.time())}"
     # Resolve log path relative to cwd if not absolute
     if log_file.strip():
         log = log_file.strip()
     else:
         base = cwd.strip() if cwd.strip() else "."
-        log = posixpath.join(base, ".codex_logs", f"{run_id}.log")
+        log = posixpath.join(base, ".codex_logs", f"{tmux_session_name}.log")
 
     log_dir = posixpath.dirname(log)
 
@@ -1052,7 +1110,7 @@ def exec_bash_background(
     inner = (
         f"mkdir -p {shlex.quote(log_dir)} && "
         f"{{"
-        f" echo '== session: {run_id}';"
+        f" echo '== session: {tmux_session_name}';"
         f" echo '== started_at: '$(date -u +%Y-%m-%dT%H:%M:%SZ);"
         f" echo '== command: {command.replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))[:120]}';"
         f" {command};"
@@ -1064,7 +1122,7 @@ def exec_bash_background(
         inner = f"cd {shlex.quote(cwd)} && " + inner
 
     tmux_cmd = (
-        f"tmux new-session -d -s {shlex.quote(run_id)} "
+        f"tmux new-session -d -s {shlex.quote(tmux_session_name)} "
         f"'bash -c {shlex.quote(inner)}'"
     )
 
@@ -1084,9 +1142,9 @@ def exec_bash_background(
             diagnosis = f"SSH connection error while launching tmux: {stderr.strip()}"
         elif "duplicate session" in combined or "already exists" in combined:
             diagnosis = (
-                f"A tmux session named {run_id!r} already exists on the remote host. "
+                f"A tmux session named {tmux_session_name!r} already exists on the remote host. "
                 "Use a different session_name or kill the existing session first with: "
-                f"tmux kill-session -t {run_id}"
+                f"tmux kill-session -t {tmux_session_name}"
             )
         elif "command not found" in combined or "no tmux" in combined:
             diagnosis = (
@@ -1110,9 +1168,9 @@ def exec_bash_background(
             "timed_out": result.get("timed_out", False),
             "connection_error": result.get("connection_error", False),
         }
-    return {
+    task = {
         "status": "started",
-        "tmux_session": run_id,
+        "tmux_session": tmux_session_name,
         "log_file": log,
         "sandbox": session.id,
         "note": (
@@ -1120,13 +1178,82 @@ def exec_bash_background(
             "Call check_background_task with this tmux_session and log_file to poll progress."
         ),
     }
+    if not watch:
+        return task
+
+    watchdog_setup = None
+    if ensure_watchdog:
+        if sys.platform == "darwin":
+            watchdog_setup = _ensure_watchdog_ready(
+                persist_current_sandboxes=True,
+                start_now=True,
+            )
+        else:
+            init_watchdog_db()
+            _persist_current_sandboxes()
+            watchdog_setup = {
+                "warning": (
+                    "ensure_watchdog=True requested outside macOS; the watch was still "
+                    "registered in SQLite, but launchd auto-start is unavailable."
+                ),
+                "status": _watchdog_status_payload(),
+            }
+    else:
+        init_watchdog_db()
+        _persist_current_sandboxes()
+
+    effective_event_command = event_command
+    if not effective_event_command.strip() and codex_wakeup:
+        effective_event_command = _default_codex_event_command(codex_command)
+
+    watch_result = watch_background_task(
+        tmux_session=task["tmux_session"],
+        log_file=task["log_file"],
+        sandbox_name=sandbox_name or task["sandbox"],
+        run_id=run_id.strip() or task["tmux_session"],
+        name=watch_name,
+        cwd=cwd,
+        launch_command=command,
+        resume_command=resume_command,
+        resume_plan_json=resume_plan_json,
+        checkpoint_path=checkpoint_path,
+        checkpoint_format=checkpoint_format,
+        checkpoint_command=checkpoint_command,
+        interval_s=interval_s,
+        max_log_lines=max_log_lines,
+        webhook_url=webhook_url,
+        event_command=effective_event_command,
+        auto_resume=auto_resume,
+        max_resume_attempts=max_resume_attempts,
+        metadata_json=metadata_json,
+        ensure_watchdog=False,
+        notify_local=notify_local,
+        alert_after_failures=alert_after_failures,
+        resume_delay_s=resume_delay_s,
+    )
+    task["watchdog_setup"] = watchdog_setup
+    task["event_command"] = effective_event_command
+    if isinstance(watch_result, dict) and watch_result.get("watch"):
+        watch_payload = watch_result["watch"]
+        task["watch"] = watch_payload
+        task["watch_id"] = watch_payload["id"]
+        task["watch_query_id"] = watch_payload["id"]
+        task["note"] = (
+            "Task is running in background. "
+            f"Call check_background_task(watch_id={watch_payload['id']}) to poll progress."
+        )
+        return task
+
+    task["watch"] = watch_result
+    return task
 
 
 @mcp.tool()
 @_safe_tool
 def check_background_task(
-    tmux_session: str,
+    tmux_session: str = "",
     log_file: str = "",
+    watch_id: int = 0,
     last_n_lines: int = 50,
     sandbox_name: str = "",
 ) -> dict:
@@ -1141,29 +1268,63 @@ def check_background_task(
     Poll this tool periodically for long tasks instead of blocking with exec_bash.
     When running=False and exit_code is present, the task is complete.
     """
-    if not tmux_session.strip():
+    resolved_watch = None
+    resolved_tmux_session = tmux_session.strip()
+    resolved_log_file = log_file.strip()
+    resolved_sandbox = sandbox_name.strip()
+    if watch_id > 0:
+        init_watchdog_db()
+        resolved_watch = get_watch(watch_id, path=str(watchdog_db_path()))
+        if resolved_watch is None:
+            raise ValueError(f"Unknown watch id: {watch_id}")
+        resolved_tmux_session = resolved_tmux_session or resolved_watch["tmux_session"]
+        resolved_log_file = resolved_log_file or resolved_watch["log_file"]
+        resolved_sandbox = resolved_sandbox or resolved_watch["sandbox_name"]
+    if not resolved_tmux_session:
         raise ValueError("tmux_session cannot be empty")
+    if last_n_lines <= 0:
+        raise ValueError("last_n_lines must be positive")
 
-    session = _get_session(sandbox_name)
+    session = _get_session(resolved_sandbox)
     client = session.ensure_connected()
 
     # Check if the tmux session exists
     check_cmd = (
-        f"tmux has-session -t {shlex.quote(tmux_session)} 2>/dev/null "
+        f"tmux has-session -t {shlex.quote(resolved_tmux_session)} 2>/dev/null "
         f"&& echo RUNNING || echo DONE"
     )
     status_result = _exec_on_channel(client, check_cmd, timeout_s=10, max_output_chars=200)
+    if status_result.get("connection_error"):
+        return {
+            "error": status_result.get("stderr", "").strip() or "SSH connection failed",
+            "connection_error": True,
+            "tmux_session": resolved_tmux_session,
+            "log_file": resolved_log_file,
+            "sandbox": session.id,
+            "watch_id": watch_id if watch_id > 0 else None,
+            "watch": resolved_watch,
+        }
     is_running = "RUNNING" in status_result.get("stdout", "")
 
     log_tail = ""
     parsed_exit_code = None
 
-    if log_file:
+    if resolved_log_file:
         tail_cmd = (
-            f"tail -n {last_n_lines} {shlex.quote(log_file)} 2>/dev/null "
+            f"tail -n {last_n_lines} {shlex.quote(resolved_log_file)} 2>/dev/null "
             f"|| echo '[log file not found]'"
         )
         log_result = _exec_on_channel(client, tail_cmd, timeout_s=15, max_output_chars=20000)
+        if log_result.get("connection_error"):
+            return {
+                "error": log_result.get("stderr", "").strip() or "SSH connection failed",
+                "connection_error": True,
+                "tmux_session": resolved_tmux_session,
+                "log_file": resolved_log_file,
+                "sandbox": session.id,
+                "watch_id": watch_id if watch_id > 0 else None,
+                "watch": resolved_watch,
+            }
         log_tail = log_result.get("stdout", "")
 
         # Try to extract EXIT_CODE from the log
@@ -1176,12 +1337,600 @@ def check_background_task(
                 break
 
     return {
-        "tmux_session": tmux_session,
+        "tmux_session": resolved_tmux_session,
         "running": is_running,
-        "log_file": log_file,
+        "log_file": resolved_log_file,
         "log_tail": log_tail,
         "exit_code": parsed_exit_code,
         "sandbox": session.id,
+        "watch_id": watch_id if watch_id > 0 else None,
+        "watch": resolved_watch,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Watchdog helpers and MCP tools
+# ---------------------------------------------------------------------------
+
+
+def _serialize_sandbox_config(cfg: SandboxConfig) -> dict:
+    return {
+        "name": cfg.name,
+        "host": cfg.host,
+        "user": cfg.user,
+        "password": cfg.password,
+        "port": cfg.port,
+        "key_file": cfg.key_file,
+        "key_passphrase": cfg.key_passphrase,
+    }
+
+
+def _persist_current_sandboxes() -> dict:
+    if _INIT_ERROR:
+        raise ValueError(f"Sandbox configuration error: {_INIT_ERROR}")
+    configs = _load_sandbox_configs()
+    if not configs:
+        raise ValueError("No sandbox configuration is available to persist")
+    return save_sandbox_config([_serialize_sandbox_config(cfg) for cfg in configs])
+
+
+def _watchdog_status_payload() -> dict:
+    init_watchdog_db()
+    active = len(list_watchdog_watches(status="active", path=str(watchdog_db_path())))
+    completed = len(list_watchdog_watches(status="completed", path=str(watchdog_db_path())))
+    cancelled = len(list_watchdog_watches(status="cancelled", path=str(watchdog_db_path())))
+    heartbeat = get_daemon_meta("heartbeat", path=str(watchdog_db_path()))
+    stale = True
+    if heartbeat and isinstance(heartbeat.get("value"), dict):
+        ts = int(heartbeat["value"].get("ts", 0))
+        stale = (int(time.time()) - ts) > HEARTBEAT_STALE_S
+    return {
+        "paths": {
+            "config_path": str(watchdog_config_path()),
+            "db_path": str(watchdog_db_path()),
+        },
+        "launchd": get_launch_agent_status(),
+        "heartbeat": heartbeat,
+        "heartbeat_stale": stale,
+        "watch_counts": {
+            "active": active,
+            "completed": completed,
+            "cancelled": cancelled,
+        },
+    }
+
+
+def _is_watchdog_heartbeat_stale() -> bool:
+    heartbeat = get_daemon_meta("heartbeat", path=str(watchdog_db_path()))
+    if not heartbeat or not isinstance(heartbeat.get("value"), dict):
+        return True
+    ts = int(heartbeat["value"].get("ts", 0))
+    return (int(time.time()) - ts) > HEARTBEAT_STALE_S
+
+
+def _ensure_watchdog_ready(
+    *,
+    persist_current_sandboxes: bool = True,
+    start_now: bool = True,
+) -> dict:
+    init_watchdog_db()
+    persisted = None
+    if persist_current_sandboxes:
+        persisted = _persist_current_sandboxes()
+
+    install = None
+    launchd = get_launch_agent_status()
+    if sys.platform == "darwin" and (
+        not launchd.get("loaded", False) or _is_watchdog_heartbeat_stale()
+    ):
+        install = install_launch_agent(
+            config_path=str(watchdog_config_path()),
+            db_path=str(watchdog_db_path()),
+            start_now=start_now,
+        )
+
+    return {
+        "persisted_sandboxes": persisted,
+        "install": install,
+        "status": _watchdog_status_payload(),
+    }
+
+
+def _default_codex_event_command(codex_command: str = "") -> str:
+    resolved = codex_command.strip() or shutil.which("codex") or "codex"
+    quoted = shlex.quote(resolved)
+    return (
+        'case "$RSMCP_EVENT_TYPE" in '
+        'ssh_unreachable|interrupted|resume_failed|completed|config_missing) '
+        f'{quoted} exec "$RSMCP_SUGGESTED_PROMPT" ;; '
+        "esac"
+    )
+
+
+def _parse_json_object(raw: str, label: str) -> dict:
+    if not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must decode to a JSON object")
+    return value
+
+
+def _prepare_resume_plan(
+    *,
+    launch_command: str,
+    resume_command: str,
+    checkpoint_path: str,
+    checkpoint_format: str,
+    checkpoint_command: str,
+    cwd: str,
+    resume_plan_json: str,
+    auto_resume: bool,
+) -> tuple[str, dict]:
+    plan = _parse_json_object(resume_plan_json, "resume_plan_json")
+
+    effective_resume = resume_command.strip() or str(plan.get("resume_command", "")).strip()
+    effective_checkpoint_path = checkpoint_path.strip() or str(plan.get("checkpoint_path", "")).strip()
+    effective_checkpoint_command = (
+        checkpoint_command.strip() or str(plan.get("checkpoint_command", "")).strip()
+    )
+    effective_checkpoint_format = (
+        checkpoint_format.strip()
+        or str(plan.get("checkpoint_format", "")).strip()
+        or "text"
+    )
+
+    if launch_command.strip():
+        plan.setdefault("launch_command", launch_command)
+    if cwd.strip():
+        plan.setdefault("cwd", cwd)
+    if effective_resume:
+        plan["resume_command"] = effective_resume
+    if effective_checkpoint_path:
+        plan["checkpoint_path"] = effective_checkpoint_path
+    if effective_checkpoint_command:
+        plan["checkpoint_command"] = effective_checkpoint_command
+    plan["checkpoint_format"] = effective_checkpoint_format
+
+    if auto_resume and not effective_resume:
+        raise ValueError("auto_resume=True requires resume_command or resume_plan_json.resume_command")
+    if auto_resume and not (effective_checkpoint_path or effective_checkpoint_command):
+        raise ValueError(
+            "auto_resume=True requires checkpoint_path or resume_plan_json.checkpoint_path"
+        )
+
+    return effective_resume, plan
+
+
+def _parse_checkpoint_payload(text: str, checkpoint_format: str) -> dict:
+    result = {
+        "raw": text,
+        "format": checkpoint_format,
+        "parsed": None,
+    }
+    if checkpoint_format.strip().lower() == "json" and text.strip():
+        try:
+            result["parsed"] = json.loads(text)
+        except json.JSONDecodeError:
+            result["parsed"] = None
+    return result
+
+
+@mcp.tool()
+@_safe_tool
+def install_macos_watchdog(
+    start_now: bool = True,
+    persist_current_sandboxes: bool = True,
+) -> dict:
+    """Install or refresh the macOS launchd watchdog service used for long tasks."""
+    init_watchdog_db()
+    persisted = None
+    if persist_current_sandboxes:
+        persisted = _persist_current_sandboxes()
+    install = install_launch_agent(
+        config_path=str(watchdog_config_path()),
+        db_path=str(watchdog_db_path()),
+        start_now=start_now,
+    )
+    return {
+        "install": install,
+        "persisted_sandboxes": persisted,
+        "status": _watchdog_status_payload(),
+    }
+
+
+@mcp.tool()
+@_safe_tool
+def uninstall_macos_watchdog() -> dict:
+    """Remove the macOS launchd watchdog service."""
+    removal = uninstall_launch_agent()
+    return {
+        "removal": removal,
+        "status": _watchdog_status_payload(),
+    }
+
+
+@mcp.tool()
+@_safe_tool
+def get_watchdog_status() -> dict:
+    """Return launchd and heartbeat status for the long-task watchdog daemon."""
+    return _watchdog_status_payload()
+
+
+@mcp.tool()
+@_safe_tool
+def watch_background_task(
+    tmux_session: str,
+    log_file: str,
+    sandbox_name: str = "",
+    run_id: str = "",
+    name: str = "",
+    cwd: str = "",
+    launch_command: str = "",
+    resume_command: str = "",
+    resume_plan_json: str = "",
+    checkpoint_path: str = "",
+    checkpoint_format: str = "text",
+    checkpoint_command: str = "",
+    interval_s: int = DEFAULT_WATCH_INTERVAL_S,
+    max_log_lines: int = DEFAULT_MAX_LOG_LINES,
+    webhook_url: str = "",
+    event_command: str = "",
+    auto_resume: bool = False,
+    max_resume_attempts: int = 1,
+    metadata_json: str = "",
+    ensure_watchdog: bool = True,
+    notify_local: bool = True,
+    alert_after_failures: int = DEFAULT_ALERT_AFTER_FAILURES,
+    resume_delay_s: int = DEFAULT_RESUME_DELAY_S,
+) -> dict:
+    """Register a background tmux task for watchdog monitoring and recovery hooks."""
+    if not tmux_session.strip():
+        raise ValueError("tmux_session cannot be empty")
+    if not log_file.strip():
+        raise ValueError("log_file cannot be empty")
+    if interval_s <= 0:
+        raise ValueError("interval_s must be positive")
+    if max_log_lines <= 0:
+        raise ValueError("max_log_lines must be positive")
+    if max_resume_attempts < 0:
+        raise ValueError("max_resume_attempts must be zero or positive")
+    if alert_after_failures < 1:
+        raise ValueError("alert_after_failures must be positive")
+    if resume_delay_s < 0:
+        raise ValueError("resume_delay_s must be zero or positive")
+
+    init_watchdog_db()
+    persisted = _persist_current_sandboxes()
+    watchdog_setup = None
+    if ensure_watchdog:
+        if sys.platform == "darwin":
+            watchdog_setup = _ensure_watchdog_ready(
+                persist_current_sandboxes=False,
+                start_now=True,
+            )
+        else:
+            watchdog_setup = {
+                "warning": (
+                    "ensure_watchdog=True requested outside macOS; watch registered in SQLite "
+                    "but launchd auto-start is unavailable."
+                )
+            }
+
+    sandbox = sandbox_name.strip() or _ACTIVE_SANDBOX
+    if not sandbox:
+        raise ValueError("sandbox_name is required when no active sandbox is selected")
+
+    metadata = _parse_json_object(metadata_json, "metadata_json")
+    effective_resume_command, resume_plan = _prepare_resume_plan(
+        launch_command=launch_command,
+        resume_command=resume_command,
+        checkpoint_path=checkpoint_path,
+        checkpoint_format=checkpoint_format,
+        checkpoint_command=checkpoint_command,
+        cwd=cwd,
+        resume_plan_json=resume_plan_json,
+        auto_resume=auto_resume,
+    )
+    resume_plan.setdefault("tmux_session", tmux_session.strip())
+
+    watch = create_watch(
+        sandbox,
+        tmux_session,
+        log_file,
+        run_id=run_id.strip() or tmux_session.strip(),
+        name=name,
+        cwd=cwd,
+        launch_command=launch_command,
+        resume_command=effective_resume_command,
+        resume_plan=resume_plan,
+        checkpoint_path=checkpoint_path.strip() or str(resume_plan.get("checkpoint_path", "")),
+        checkpoint_format=str(resume_plan.get("checkpoint_format", checkpoint_format or "text")),
+        checkpoint_command=checkpoint_command.strip() or str(resume_plan.get("checkpoint_command", "")),
+        interval_s=interval_s,
+        max_log_lines=max_log_lines,
+        webhook_url=webhook_url,
+        event_command=event_command,
+        auto_resume=auto_resume,
+        max_resume_attempts=max_resume_attempts,
+        alert_after_failures=alert_after_failures,
+        notify_local=notify_local,
+        resume_delay_s=resume_delay_s,
+        metadata=metadata,
+        path=str(watchdog_db_path()),
+    )
+    return {
+        "watch": watch,
+        "watch_id": watch["id"],
+        "watch_query_id": watch["id"],
+        "persisted_sandboxes": persisted,
+        "watchdog_setup": watchdog_setup,
+        "status": _watchdog_status_payload(),
+    }
+
+
+@mcp.tool()
+@_safe_tool
+def exec_bash_background_watch(
+    command: str,
+    session_name: str = "",
+    log_file: str = "",
+    cwd: str = "",
+    sandbox_name: str = "",
+    run_id: str = "",
+    watch_name: str = "",
+    resume_command: str = "",
+    resume_plan_json: str = "",
+    checkpoint_path: str = "",
+    checkpoint_format: str = "text",
+    checkpoint_command: str = "",
+    interval_s: int = DEFAULT_WATCH_INTERVAL_S,
+    max_log_lines: int = DEFAULT_MAX_LOG_LINES,
+    webhook_url: str = "",
+    event_command: str = "",
+    auto_resume: bool = False,
+    max_resume_attempts: int = 1,
+    metadata_json: str = "",
+    ensure_watchdog: bool = True,
+    notify_local: bool = True,
+    alert_after_failures: int = DEFAULT_ALERT_AFTER_FAILURES,
+    resume_delay_s: int = DEFAULT_RESUME_DELAY_S,
+    codex_wakeup: bool = False,
+    codex_command: str = "",
+) -> dict:
+    """Backward-compatible alias for exec_bash_background with watch=True."""
+    return exec_bash_background(
+        command=command,
+        session_name=session_name,
+        log_file=log_file,
+        cwd=cwd,
+        sandbox_name=sandbox_name,
+        watch=True,
+        ensure_watchdog=ensure_watchdog,
+        run_id=run_id,
+        watch_name=watch_name,
+        resume_command=resume_command,
+        resume_plan_json=resume_plan_json,
+        checkpoint_path=checkpoint_path,
+        checkpoint_format=checkpoint_format,
+        checkpoint_command=checkpoint_command,
+        interval_s=interval_s,
+        max_log_lines=max_log_lines,
+        webhook_url=webhook_url,
+        event_command=event_command,
+        auto_resume=auto_resume,
+        max_resume_attempts=max_resume_attempts,
+        metadata_json=metadata_json,
+        notify_local=notify_local,
+        alert_after_failures=alert_after_failures,
+        resume_delay_s=resume_delay_s,
+        codex_wakeup=codex_wakeup,
+        codex_command=codex_command,
+    )
+
+
+@mcp.tool()
+@_safe_tool
+def list_background_watches(status: str = "") -> dict:
+    """List registered watchdog watches."""
+    init_watchdog_db()
+    return {
+        "watches": list_watchdog_watches(status=status.strip(), path=str(watchdog_db_path())),
+        "status": _watchdog_status_payload(),
+    }
+
+
+@mcp.tool()
+@_safe_tool
+def get_background_watch(watch_id: int) -> dict:
+    """Fetch one watchdog watch by id."""
+    init_watchdog_db()
+    watch = get_watch(watch_id, path=str(watchdog_db_path()))
+    if watch is None:
+        raise ValueError(f"Unknown watch id: {watch_id}")
+    return {"watch": watch}
+
+
+@mcp.tool()
+@_safe_tool
+def get_background_watch_progress(
+    watch_id: int,
+    refresh_live: bool = True,
+    log_lines: int = 80,
+    checkpoint_max_bytes: int = 20000,
+) -> dict:
+    """Return stored and live progress for one watchdog watch."""
+    init_watchdog_db()
+    watch = get_watch(watch_id, path=str(watchdog_db_path()))
+    if watch is None:
+        raise ValueError(f"Unknown watch id: {watch_id}")
+
+    live_task = None
+    live_checkpoint = None
+    live_errors: list[dict] = []
+
+    if refresh_live:
+        live_task = check_background_task(
+            watch_id=watch_id,
+            last_n_lines=log_lines,
+        )
+        if isinstance(live_task, dict) and live_task.get("error"):
+            live_errors.append({"kind": "task", "error": live_task["error"]})
+
+        checkpoint_path = watch.get("checkpoint_path", "").strip()
+        checkpoint_command = str(watch.get("resume_plan", {}).get("checkpoint_command", "")).strip() or watch.get("checkpoint_command", "").strip()
+        if checkpoint_command:
+            checkpoint_result = exec_bash(
+                command=checkpoint_command,
+                cwd=watch.get("cwd", ""),
+                timeout_s=30,
+                max_output_chars=checkpoint_max_bytes,
+                sandbox_name=watch["sandbox_name"],
+            )
+            if checkpoint_result.get("error"):
+                live_errors.append({"kind": "checkpoint", "error": checkpoint_result["error"]})
+            else:
+                live_checkpoint = _parse_checkpoint_payload(
+                    checkpoint_result.get("stdout", ""),
+                    watch.get("checkpoint_format", "text"),
+                )
+        elif checkpoint_path:
+            checkpoint_result = read_remote_file(
+                remote_path=checkpoint_path,
+                max_bytes=checkpoint_max_bytes,
+                sandbox_name=watch["sandbox_name"],
+            )
+            if checkpoint_result.get("error"):
+                live_errors.append({"kind": "checkpoint", "error": checkpoint_result["error"]})
+            else:
+                live_checkpoint = _parse_checkpoint_payload(
+                    checkpoint_result.get("content", ""),
+                    watch.get("checkpoint_format", "text"),
+                )
+
+    stored_checkpoint = _parse_checkpoint_payload(
+        watch.get("last_checkpoint_text", ""),
+        watch.get("checkpoint_format", "text"),
+    )
+
+    return {
+        "watch": watch,
+        "stored": {
+            "last_state": watch.get("last_state", ""),
+            "last_summary": watch.get("last_summary", ""),
+            "last_error": watch.get("last_error", ""),
+            "last_log_tail": watch.get("last_log_tail", ""),
+            "checkpoint": stored_checkpoint,
+        },
+        "live": {
+            "task": live_task,
+            "checkpoint": live_checkpoint,
+            "errors": live_errors,
+        },
+    }
+
+
+@mcp.tool()
+@_safe_tool
+def read_background_watch_log(
+    watch_id: int,
+    last_n_lines: int = 200,
+) -> dict:
+    """Read the latest remote log tail for one watchdog watch."""
+    init_watchdog_db()
+    watch = get_watch(watch_id, path=str(watchdog_db_path()))
+    if watch is None:
+        raise ValueError(f"Unknown watch id: {watch_id}")
+    live_task = check_background_task(
+        watch_id=watch_id,
+        last_n_lines=last_n_lines,
+    )
+    return {
+        "watch": watch,
+        "log": live_task,
+    }
+
+
+@mcp.tool()
+@_safe_tool
+def read_background_watch_checkpoint(
+    watch_id: int,
+    max_bytes: int = 20000,
+) -> dict:
+    """Read the latest checkpoint snapshot for one watchdog watch."""
+    init_watchdog_db()
+    watch = get_watch(watch_id, path=str(watchdog_db_path()))
+    if watch is None:
+        raise ValueError(f"Unknown watch id: {watch_id}")
+
+    checkpoint_command = (
+        str(watch.get("resume_plan", {}).get("checkpoint_command", "")).strip()
+        or watch.get("checkpoint_command", "").strip()
+    )
+    if checkpoint_command:
+        result = exec_bash(
+            command=checkpoint_command,
+            cwd=watch.get("cwd", ""),
+            timeout_s=30,
+            max_output_chars=max_bytes,
+            sandbox_name=watch["sandbox_name"],
+        )
+        payload = _parse_checkpoint_payload(
+            result.get("stdout", ""),
+            watch.get("checkpoint_format", "text"),
+        )
+        return {
+            "watch": watch,
+            "checkpoint": payload,
+            "command_result": result,
+        }
+
+    checkpoint_path = watch.get("checkpoint_path", "").strip()
+    if not checkpoint_path:
+        raise ValueError(f"Watch {watch_id} does not define checkpoint_path or checkpoint_command")
+
+    result = read_remote_file(
+        remote_path=checkpoint_path,
+        max_bytes=max_bytes,
+        sandbox_name=watch["sandbox_name"],
+    )
+    payload = _parse_checkpoint_payload(
+        result.get("content", ""),
+        watch.get("checkpoint_format", "text"),
+    )
+    return {
+        "watch": watch,
+        "checkpoint": payload,
+        "file_result": result,
+    }
+
+
+@mcp.tool()
+@_safe_tool
+def cancel_background_watch(watch_id: int) -> dict:
+    """Stop watchdog monitoring for one watch."""
+    init_watchdog_db()
+    watch = cancel_watchdog_watch(watch_id, path=str(watchdog_db_path()))
+    return {
+        "watch": watch,
+        "status": _watchdog_status_payload(),
+    }
+
+
+@mcp.tool()
+@_safe_tool
+def list_background_watch_events(watch_id: int = 0, limit: int = 20) -> dict:
+    """List watchdog events for one watch or for all watches."""
+    init_watchdog_db()
+    return {
+        "events": list_watchdog_events(
+            watch_id=watch_id,
+            limit=limit,
+            path=str(watchdog_db_path()),
+        )
     }
 
 
@@ -1464,7 +2213,28 @@ def sync_remote_to_local(
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    if len(sys.argv) == 1:
+        mcp.run(transport="stdio")
+        return
+
+    parser = argparse.ArgumentParser(prog="remote-sandbox-mcp")
+    subparsers = parser.add_subparsers(dest="command")
+
+    daemon_parser = subparsers.add_parser("daemon", help="Run the local watchdog daemon")
+    daemon_parser.add_argument("--config", default=str(watchdog_config_path()))
+    daemon_parser.add_argument("--db", default=str(watchdog_db_path()))
+    daemon_parser.add_argument("--loop-sleep", type=int, default=5)
+
+    args = parser.parse_args()
+    if args.command == "daemon":
+        WatchdogDaemon(
+            config_path=args.config,
+            db_path=args.db,
+            loop_sleep_s=args.loop_sleep,
+        ).run_forever()
+        return
+
+    parser.error(f"unknown subcommand: {args.command}")
 
 
 if __name__ == "__main__":
