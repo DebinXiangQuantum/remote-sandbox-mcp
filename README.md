@@ -175,6 +175,19 @@ remote-sandbox-mcp
 
 ## 7. 可用工具
 
+默认公开的 MCP 工具只有这几类：
+- 沙箱管理：`list_sandboxes`、`select_sandbox`、`get_active_sandbox`
+- 命令执行：`exec_bash`、`exec_bash_background`、`check_background_task`
+- 文件操作：`list_remote_files`、`read_remote_file`、`sync_local_to_remote`、`sync_remote_to_local`
+
+这样可以把工具列表压到最小，减少 Agent 的上下文负担。
+watchdog 相关的高级运维工具默认**不暴露**；`exec_bash_background()` 会在内部自动使用它们。
+如果你确实需要手动排查/操作 watchdog，再设置环境变量：
+
+```bash
+export REMOTE_SANDBOX_EXPOSE_ADVANCED_TOOLS=1
+```
+
 ### 沙箱管理
 
 #### `list_sandboxes`
@@ -251,9 +264,10 @@ remote-sandbox-mcp
 
 ---
 
-### 长任务守护
+### 高级 Watchdog 工具（默认不暴露）
 
 以下工具用于在 **macOS 本机** 安装一个常驻 watchdog。watchdog 独立于 MCP `stdio` 进程，因此 Codex/Claude 会话结束后仍会继续轮询后台任务。
+它们默认不出现在 MCP 工具列表里，避免浪费上下文；只有在设置 `REMOTE_SANDBOX_EXPOSE_ADVANCED_TOOLS=1` 时才会暴露。
 
 正常情况下，你**不需要**先手动调用 `install_macos_watchdog()`。
 直接调用 `exec_bash_background()` 即可；它默认会在后台自动确保 watchdog 已安装/启动，并为这次长任务登记 watch。

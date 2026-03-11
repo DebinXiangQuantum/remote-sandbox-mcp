@@ -43,6 +43,10 @@ from remote_sandbox_mcp.watchdog_store import (
 )
 
 mcp = FastMCP("remote-sandbox")
+_EXPOSE_ADVANCED_TOOLS = os.environ.get(
+    "REMOTE_SANDBOX_EXPOSE_ADVANCED_TOOLS",
+    "",
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _safe_tool(fn: Callable) -> Callable:
@@ -55,6 +59,16 @@ def _safe_tool(fn: Callable) -> Callable:
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
     return wrapper
+
+
+def _optional_tool(*, enabled: bool) -> Callable[[Callable], Callable]:
+    def decorator(fn: Callable) -> Callable:
+        wrapped = _safe_tool(fn)
+        if enabled:
+            return mcp.tool()(wrapped)
+        return wrapped
+
+    return decorator
 
 
 DEFAULT_EXCLUDES = [
@@ -1519,8 +1533,7 @@ def _parse_checkpoint_payload(text: str, checkpoint_format: str) -> dict:
     return result
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def install_macos_watchdog(
     start_now: bool = True,
     persist_current_sandboxes: bool = True,
@@ -1542,8 +1555,7 @@ def install_macos_watchdog(
     }
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def uninstall_macos_watchdog() -> dict:
     """Remove the macOS launchd watchdog service."""
     removal = uninstall_launch_agent()
@@ -1553,15 +1565,13 @@ def uninstall_macos_watchdog() -> dict:
     }
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def get_watchdog_status() -> dict:
     """Return launchd and heartbeat status for the long-task watchdog daemon."""
     return _watchdog_status_payload()
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def watch_background_task(
     tmux_session: str,
     log_file: str,
@@ -1672,8 +1682,7 @@ def watch_background_task(
     }
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def exec_bash_background_watch(
     command: str,
     session_name: str = "",
@@ -1732,8 +1741,7 @@ def exec_bash_background_watch(
     )
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def list_background_watches(status: str = "") -> dict:
     """List registered watchdog watches."""
     init_watchdog_db()
@@ -1743,8 +1751,7 @@ def list_background_watches(status: str = "") -> dict:
     }
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def get_background_watch(watch_id: int) -> dict:
     """Fetch one watchdog watch by id."""
     init_watchdog_db()
@@ -1754,8 +1761,7 @@ def get_background_watch(watch_id: int) -> dict:
     return {"watch": watch}
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def get_background_watch_progress(
     watch_id: int,
     refresh_live: bool = True,
@@ -1833,8 +1839,7 @@ def get_background_watch_progress(
     }
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def read_background_watch_log(
     watch_id: int,
     last_n_lines: int = 200,
@@ -1854,8 +1859,7 @@ def read_background_watch_log(
     }
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def read_background_watch_checkpoint(
     watch_id: int,
     max_bytes: int = 20000,
@@ -1908,8 +1912,7 @@ def read_background_watch_checkpoint(
     }
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def cancel_background_watch(watch_id: int) -> dict:
     """Stop watchdog monitoring for one watch."""
     init_watchdog_db()
@@ -1920,8 +1923,7 @@ def cancel_background_watch(watch_id: int) -> dict:
     }
 
 
-@mcp.tool()
-@_safe_tool
+@_optional_tool(enabled=_EXPOSE_ADVANCED_TOOLS)
 def list_background_watch_events(watch_id: int = 0, limit: int = 20) -> dict:
     """List watchdog events for one watch or for all watches."""
     init_watchdog_db()
