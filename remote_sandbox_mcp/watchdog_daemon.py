@@ -276,6 +276,48 @@ def _check_task(
     }
 
 
+def _remote_home(session: SandboxSession) -> str:
+    client = session.ensure_connected()
+    result = _exec_on_channel(client, 'printf "%s" "$HOME"', timeout_s=10, max_output_chars=200)
+    home = result.get("stdout", "").strip()
+    if result.get("exit_code") != 0 or not home:
+        raise ValueError("Unable to resolve remote home directory")
+    return home
+
+
+def _resolve_remote_path(session: SandboxSession, cwd: str, path: str) -> str:
+    raw_path = path.strip()
+    if not raw_path:
+        return ""
+
+    home = _remote_home(session)
+    raw_cwd = cwd.strip()
+    resolved_cwd = raw_cwd
+    if resolved_cwd == "~":
+        resolved_cwd = home
+    elif resolved_cwd.startswith("~/"):
+        resolved_cwd = posixpath.join(home, resolved_cwd[2:])
+    elif resolved_cwd and not posixpath.isabs(resolved_cwd):
+        resolved_cwd = posixpath.normpath(posixpath.join(home, resolved_cwd))
+
+    if raw_path == "~":
+        return home
+    if raw_path.startswith("~/"):
+        return posixpath.join(home, raw_path[2:])
+    if posixpath.isabs(raw_path):
+        return posixpath.normpath(raw_path)
+
+    base_dir = resolved_cwd or home
+    normalized_path = posixpath.normpath(raw_path)
+    if raw_cwd and not posixpath.isabs(raw_cwd):
+        normalized_cwd = posixpath.normpath(raw_cwd)
+        cwd_prefix = normalized_cwd.rstrip("/") + "/"
+        if normalized_path == normalized_cwd or normalized_path.startswith(cwd_prefix):
+            suffix = posixpath.relpath(normalized_path, normalized_cwd)
+            return posixpath.normpath(posixpath.join(base_dir, suffix))
+    return posixpath.normpath(posixpath.join(base_dir, normalized_path))
+
+
 def _start_background_task(
     session: SandboxSession,
     command: str,
@@ -284,22 +326,48 @@ def _start_background_task(
     log_file: str,
 ) -> dict[str, Any]:
     client = session.ensure_connected()
-    log_dir = posixpath.dirname(log_file)
-    inner = (
-        f"mkdir -p {shlex.quote(log_dir)} && "
-        f"{{"
-        f" echo '== session: {session_name}';"
-        f" echo '== started_at: '$(date -u +%Y-%m-%dT%H:%M:%SZ);"
-        f" echo '== command: {command.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))[:120]}';"
-        f" {command};"
-        f" echo \"EXIT_CODE=$?\";"
-        f"}} 2>&1 | tee -a {shlex.quote(log_file)}"
+    resolved_cwd = _resolve_remote_path(session, "", cwd)
+    resolved_log_file = _resolve_remote_path(session, cwd, log_file)
+    command_log_file = resolved_log_file
+    if resolved_cwd:
+        command_log_file = posixpath.relpath(resolved_log_file, resolved_cwd)
+    command_preview = " ".join(command.split())[:120]
+    script_content = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -uo pipefail",
+            f"mkdir -p {shlex.quote(posixpath.dirname(command_log_file) or '.')}",
+            *((f"cd {shlex.quote(resolved_cwd)}",) if resolved_cwd else ()),
+            "{",
+            f"  printf '%s\\n' {shlex.quote(f'== session: {session_name}')}",
+            "  printf '== started_at: %s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"",
+            f"  printf '%s\\n' {shlex.quote(f'== command: {command_preview}')}",
+            f"  {command}",
+            "  rc=$?",
+            "  printf 'EXIT_CODE=%s\\n' \"$rc\"",
+            f"}} 2>&1 | tee -a {shlex.quote(command_log_file)}",
+            "rc=${PIPESTATUS[0]}",
+            "exit \"$rc\"",
+        ]
     )
-    if cwd.strip():
-        inner = f"cd {shlex.quote(cwd)} && " + inner
+    script_path = posixpath.join(
+        posixpath.dirname(resolved_log_file) or ".codex_logs",
+        ".rsmcp",
+        f"{session_name}.sh",
+    )
+    launcher = "\n".join(
+        [
+            f"mkdir -p {shlex.quote(posixpath.dirname(script_path) or '.')}",
+            "cat > " + shlex.quote(script_path) + " <<'__RSMCP_BG__'",
+            script_content,
+            "__RSMCP_BG__",
+            f"chmod 700 {shlex.quote(script_path)}",
+            f"tmux new-session -d -s {shlex.quote(session_name)} bash {shlex.quote(script_path)}",
+        ]
+    )
     result = _exec_on_channel(
         client,
-        f"tmux new-session -d -s {shlex.quote(session_name)} 'bash -c {shlex.quote(inner)}'",
+        launcher,
         timeout_s=15,
         max_output_chars=2000,
     )

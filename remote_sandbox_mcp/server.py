@@ -82,6 +82,7 @@ DEFAULT_EXCLUDES = [
 
 _CONNECT_TIMEOUT = 15.0
 _HEALTH_CHECK_INTERVAL = 30.0  # seconds between keep-alive probes
+_SSH_KEEPALIVE_INTERVAL_S = 15  # seconds between Paramiko keepalives
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +280,24 @@ class SandboxSession:
             raise ConnectionError(
                 f"SSH connect failed to {cfg.host}:{cfg.port}: {exc}"
             ) from exc
+        transport = client.get_transport()
+        if transport is not None:
+            try:
+                transport.set_keepalive(_SSH_KEEPALIVE_INTERVAL_S)
+            except Exception:
+                pass
+        setattr(client, "_rsmcp_session", self)
         return client
+
+    def _reset_client_locked(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+        self._last_health_check = 0.0
+        _REMOTE_HOME_CACHE.pop(self.id, None)
 
     def is_alive(self) -> bool:
         """Non-blocking check: True if the current transport is still active."""
@@ -297,29 +315,35 @@ class SandboxSession:
     def ensure_connected(self) -> paramiko.SSHClient:
         """Return a live SSHClient, transparently reconnecting if the session dropped."""
         with self._lock:
+            if self._client is not None:
+                transport = self._client.get_transport()
+                if transport is None or not transport.is_active():
+                    self._reset_client_locked()
+
             now = time.monotonic()
-            if now - self._last_health_check > _HEALTH_CHECK_INTERVAL:
+            if self._client is not None and now - self._last_health_check > _HEALTH_CHECK_INTERVAL:
                 if not self.is_alive():
-                    if self._client is not None:
-                        try:
-                            self._client.close()
-                        except Exception:
-                            pass
-                        self._client = None
+                    self._reset_client_locked()
                 self._last_health_check = now
 
             if self._client is None:
                 self._client = self._make_client()
+                self._last_health_check = now
+            return self._client
+
+    def mark_broken(self) -> None:
+        with self._lock:
+            self._reset_client_locked()
+
+    def reconnect(self) -> paramiko.SSHClient:
+        with self._lock:
+            self._reset_client_locked()
+            self._client = self._make_client()
+            self._last_health_check = time.monotonic()
             return self._client
 
     def close(self) -> None:
-        with self._lock:
-            if self._client is not None:
-                try:
-                    self._client.close()
-                except Exception:
-                    pass
-                self._client = None
+        self.mark_broken()
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +354,7 @@ _SESSIONS: dict[str, SandboxSession] = {}
 _ACTIVE_SANDBOX: Optional[str] = None
 _REGISTRY_LOCK = threading.Lock()
 _INIT_ERROR: Optional[str] = None  # surface config errors to tool callers
+_REMOTE_HOME_CACHE: dict[str, str] = {}
 
 
 def _init_sessions() -> None:
@@ -477,9 +502,167 @@ def _query_resources(session: SandboxSession) -> dict:
         return {"error": str(exc)}
 
 
+def _remote_home(session: SandboxSession) -> str:
+    cached = _REMOTE_HOME_CACHE.get(session.id)
+    if cached:
+        return cached
+    client = session.ensure_connected()
+    result = _exec_on_channel(client, 'printf "%s" "$HOME"', timeout_s=10, max_output_chars=200)
+    home = result.get("stdout", "").strip()
+    if result.get("exit_code") != 0 or not home:
+        raise ValueError("Unable to resolve remote home directory")
+    _REMOTE_HOME_CACHE[session.id] = home
+    return home
+
+
+def _expand_remote_user_path(session: SandboxSession, path: str) -> str:
+    raw = path.strip()
+    if not raw:
+        return ""
+    if raw == "~":
+        return _remote_home(session)
+    if raw.startswith("~/"):
+        return posixpath.join(_remote_home(session), raw[2:])
+    return raw
+
+
+def _resolve_watch_path(session: SandboxSession, cwd: str, path: str) -> str:
+    raw_path = path.strip()
+    if not raw_path:
+        return ""
+    raw_cwd = cwd.strip()
+    resolved_cwd = _expand_remote_user_path(session, raw_cwd)
+    if resolved_cwd and not posixpath.isabs(resolved_cwd):
+        resolved_cwd = posixpath.normpath(posixpath.join(_remote_home(session), resolved_cwd))
+    resolved_path = _expand_remote_user_path(session, raw_path)
+    if posixpath.isabs(resolved_path):
+        return posixpath.normpath(resolved_path)
+
+    base_dir = resolved_cwd or _remote_home(session)
+    normalized_path = posixpath.normpath(resolved_path)
+    if raw_cwd and not posixpath.isabs(raw_cwd):
+        normalized_cwd = posixpath.normpath(_expand_remote_user_path(session, raw_cwd))
+        cwd_prefix = normalized_cwd.rstrip("/") + "/"
+        if normalized_path == normalized_cwd or normalized_path.startswith(cwd_prefix):
+            suffix = posixpath.relpath(normalized_path, normalized_cwd)
+            return posixpath.normpath(posixpath.join(base_dir, suffix))
+    return posixpath.normpath(posixpath.join(base_dir, normalized_path))
+
+
+def _resolve_background_paths(
+    session: SandboxSession,
+    *,
+    cwd: str,
+    log_file: str,
+    session_name: str,
+) -> tuple[str, str, str]:
+    raw_cwd = cwd.strip()
+    resolved_cwd = _expand_remote_user_path(session, raw_cwd)
+    if resolved_cwd and not posixpath.isabs(resolved_cwd):
+        resolved_cwd = posixpath.normpath(posixpath.join(_remote_home(session), resolved_cwd))
+    raw_log = log_file.strip() or posixpath.join(".codex_logs", f"{session_name}.log")
+    resolved_log = _expand_remote_user_path(session, raw_log)
+    if posixpath.isabs(resolved_log):
+        watch_log = resolved_log
+    else:
+        base_dir = resolved_cwd or _remote_home(session)
+        normalized_log = posixpath.normpath(resolved_log)
+        if raw_cwd and not posixpath.isabs(raw_cwd):
+            normalized_cwd = posixpath.normpath(_expand_remote_user_path(session, raw_cwd))
+            cwd_prefix = normalized_cwd.rstrip("/") + "/"
+            if normalized_log == normalized_cwd or normalized_log.startswith(cwd_prefix):
+                suffix = posixpath.relpath(normalized_log, normalized_cwd)
+                watch_log = posixpath.normpath(posixpath.join(base_dir, suffix))
+            else:
+                watch_log = posixpath.normpath(posixpath.join(base_dir, normalized_log))
+        else:
+            watch_log = posixpath.normpath(posixpath.join(base_dir, normalized_log))
+
+    if posixpath.isabs(resolved_log):
+        command_log = resolved_log
+    elif resolved_cwd:
+        command_log = posixpath.relpath(watch_log, resolved_cwd)
+    else:
+        command_log = watch_log
+    return resolved_cwd, command_log, watch_log
+
+
+def _background_script_path(log_file: str, session_name: str) -> str:
+    log_dir = posixpath.dirname(log_file) or ".codex_logs"
+    return posixpath.join(log_dir, ".rsmcp", f"{session_name}.sh")
+
+
+def _build_background_script(
+    *,
+    command: str,
+    cwd: str,
+    session_name: str,
+    log_file: str,
+) -> str:
+    command_preview = " ".join(command.split())[:120]
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -uo pipefail",
+        f"mkdir -p {shlex.quote(posixpath.dirname(log_file) or '.')}",
+    ]
+    if cwd:
+        lines.append(f"cd {shlex.quote(cwd)}")
+    lines.extend(
+        [
+            "{",
+            f"  printf '%s\\n' {shlex.quote(f'== session: {session_name}')}",
+            "  printf '== started_at: %s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"",
+            f"  printf '%s\\n' {shlex.quote(f'== command: {command_preview}')}",
+            f"  {command}",
+            "  rc=$?",
+            "  printf 'EXIT_CODE=%s\\n' \"$rc\"",
+            f"}} 2>&1 | tee -a {shlex.quote(log_file)}",
+            "rc=${PIPESTATUS[0]}",
+            "exit \"$rc\"",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_tmux_new_session_command(
+    session_name: str,
+    *,
+    script_path: str,
+    script_content: str,
+) -> str:
+    heredoc = "__RSMCP_BG__"
+    return "\n".join(
+        [
+            f"mkdir -p {shlex.quote(posixpath.dirname(script_path) or '.')}",
+            f"cat > {shlex.quote(script_path)} <<'{heredoc}'",
+            script_content,
+            heredoc,
+            f"chmod 700 {shlex.quote(script_path)}",
+            f"tmux new-session -d -s {shlex.quote(session_name)} bash {shlex.quote(script_path)}",
+        ]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core exec helper with reliable two-layer timeout
 # ---------------------------------------------------------------------------
+
+
+def _is_retriable_transport_error(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, EOFError, OSError, paramiko.SSHException)):
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "transport is not active",
+            "channel closed",
+            "channel open failure",
+            "socket is closed",
+            "connection reset",
+            "broken pipe",
+        )
+    )
 
 
 def _exec_on_channel(
@@ -499,102 +682,118 @@ def _exec_on_channel(
     Returns a dict with keys: exit_code, stdout, stderr, command, and optionally
     timed_out=True or connection_error=True.
     """
-    transport = client.get_transport()
-    if transport is None or not transport.is_active():
-        raise ConnectionError("SSH transport is not active; the connection may have dropped")
-
-    # Layer 1: wrap with GNU timeout(1) for a hard server-side kill
+    session: Optional[SandboxSession] = getattr(client, "_rsmcp_session", None)
     wrapped = f"timeout {timeout_s}s bash -c {shlex.quote(command)}"
+    attempts_remaining = 1 if session is not None else 0
+    active_client = client
 
-    channel = transport.open_session()
-    # Layer 2: socket-level timeout a few seconds beyond the remote kill window
-    channel.settimeout(float(timeout_s + 10))
+    while True:
+        transport = active_client.get_transport()
+        if transport is None or not transport.is_active():
+            if session is not None and attempts_remaining > 0:
+                active_client = session.reconnect()
+                attempts_remaining -= 1
+                continue
+            raise ConnectionError("SSH transport is not active; the connection may have dropped")
 
-    stdout_buf: list[bytes] = []
-    stderr_buf: list[bytes] = []
-    deadline = time.monotonic() + timeout_s + 10
+        stdout_buf: list[bytes] = []
+        stderr_buf: list[bytes] = []
+        deadline = time.monotonic() + timeout_s + 10
+        channel = None
 
-    try:
-        channel.exec_command(wrapped)
+        try:
+            channel = transport.open_session()
+            channel.settimeout(float(timeout_s + 10))
+            channel.exec_command(wrapped)
 
-        while True:
-            if time.monotonic() > deadline:
-                channel.close()
-                out = b"".join(stdout_buf).decode("utf-8", errors="replace")
-                return {
-                    "exit_code": -1,
-                    "stdout": out[-max_output_chars:] if len(out) > max_output_chars else out,
-                    "stderr": (
-                        f"[TIMEOUT] Client-side deadline exceeded after {timeout_s}s. "
-                        "The remote process may still be running."
-                    ),
-                    "command": command,
-                    "timed_out": True,
-                }
+            while True:
+                if time.monotonic() > deadline:
+                    channel.close()
+                    out = b"".join(stdout_buf).decode("utf-8", errors="replace")
+                    return {
+                        "exit_code": -1,
+                        "stdout": out[-max_output_chars:] if len(out) > max_output_chars else out,
+                        "stderr": (
+                            f"[TIMEOUT] Client-side deadline exceeded after {timeout_s}s. "
+                            "The remote process may still be running."
+                        ),
+                        "command": command,
+                        "timed_out": True,
+                    }
 
-            if channel.recv_ready():
-                data = channel.recv(65536)
-                if data:
-                    stdout_buf.append(data)
-            if channel.recv_stderr_ready():
-                data = channel.recv_stderr(65536)
-                if data:
-                    stderr_buf.append(data)
-
-            if channel.exit_status_ready():
-                # Drain remaining output before reading exit status
-                while channel.recv_ready():
+                if channel.recv_ready():
                     data = channel.recv(65536)
                     if data:
                         stdout_buf.append(data)
-                while channel.recv_stderr_ready():
+                if channel.recv_stderr_ready():
                     data = channel.recv_stderr(65536)
                     if data:
                         stderr_buf.append(data)
-                break
 
-            time.sleep(0.05)
+                if channel.exit_status_ready():
+                    while channel.recv_ready():
+                        data = channel.recv(65536)
+                        if data:
+                            stdout_buf.append(data)
+                    while channel.recv_stderr_ready():
+                        data = channel.recv_stderr(65536)
+                        if data:
+                            stderr_buf.append(data)
+                    break
 
-        exit_code = channel.recv_exit_status()
+                time.sleep(0.05)
 
-    except Exception as exc:
-        out = b"".join(stdout_buf).decode("utf-8", errors="replace")
-        err = b"".join(stderr_buf).decode("utf-8", errors="replace")
-        return {
-            "exit_code": -1,
-            "stdout": out[-max_output_chars:] if len(out) > max_output_chars else out,
-            "stderr": (err + f"\n[CONNECTION ERROR] {exc}").strip(),
+            exit_code = channel.recv_exit_status()
+        except Exception as exc:
+            if (
+                session is not None
+                and attempts_remaining > 0
+                and not stdout_buf
+                and not stderr_buf
+                and _is_retriable_transport_error(exc)
+            ):
+                session.mark_broken()
+                active_client = session.reconnect()
+                attempts_remaining -= 1
+                continue
+
+            out = b"".join(stdout_buf).decode("utf-8", errors="replace")
+            err = b"".join(stderr_buf).decode("utf-8", errors="replace")
+            return {
+                "exit_code": -1,
+                "stdout": out[-max_output_chars:] if len(out) > max_output_chars else out,
+                "stderr": (err + f"\n[CONNECTION ERROR] {exc}").strip(),
+                "command": command,
+                "connection_error": True,
+            }
+        finally:
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+
+        out_text = b"".join(stdout_buf).decode("utf-8", errors="replace")
+        err_text = b"".join(stderr_buf).decode("utf-8", errors="replace")
+
+        if len(out_text) > max_output_chars:
+            out_text = out_text[:max_output_chars] + "\n...<truncated>"
+        if len(err_text) > max_output_chars:
+            err_text = err_text[:max_output_chars] + "\n...<truncated>"
+
+        result: dict = {
+            "exit_code": exit_code,
+            "stdout": out_text,
+            "stderr": err_text,
             "command": command,
-            "connection_error": True,
         }
-    finally:
-        try:
-            channel.close()
-        except Exception:
-            pass
-
-    out_text = b"".join(stdout_buf).decode("utf-8", errors="replace")
-    err_text = b"".join(stderr_buf).decode("utf-8", errors="replace")
-
-    if len(out_text) > max_output_chars:
-        out_text = out_text[:max_output_chars] + "\n...<truncated>"
-    if len(err_text) > max_output_chars:
-        err_text = err_text[:max_output_chars] + "\n...<truncated>"
-
-    result: dict = {
-        "exit_code": exit_code,
-        "stdout": out_text,
-        "stderr": err_text,
-        "command": command,
-    }
-    # GNU timeout exits 124 when it kills the remote process
-    if exit_code == 124:
-        result["timed_out"] = True
-        result["stderr"] = (
-            result["stderr"]
-            + f"\n[TIMEOUT] Remote process killed by timeout after {timeout_s}s"
-        ).strip()
-    return result
+        if exit_code == 124:
+            result["timed_out"] = True
+            result["stderr"] = (
+                result["stderr"]
+                + f"\n[TIMEOUT] Remote process killed by timeout after {timeout_s}s"
+            ).strip()
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1111,87 +1310,106 @@ def exec_bash_background(
     client = session.ensure_connected()
 
     tmux_session_name = session_name.strip() or f"bg-{int(time.time())}"
-    # Resolve log path relative to cwd if not absolute
-    if log_file.strip():
-        log = log_file.strip()
-    else:
-        base = cwd.strip() if cwd.strip() else "."
-        log = posixpath.join(base, ".codex_logs", f"{tmux_session_name}.log")
-
-    log_dir = posixpath.dirname(log)
-
-    # Build the inner command: run user command, capture output, write exit code
-    inner = (
-        f"mkdir -p {shlex.quote(log_dir)} && "
-        f"{{"
-        f" echo '== session: {tmux_session_name}';"
-        f" echo '== started_at: '$(date -u +%Y-%m-%dT%H:%M:%SZ);"
-        f" echo '== command: {command.replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))[:120]}';"
-        f" {command};"
-        f" echo \"EXIT_CODE=$?\";"
-        f"}} 2>&1 | tee -a {shlex.quote(log)}"
+    resolved_cwd, command_log, watch_log = _resolve_background_paths(
+        session,
+        cwd=cwd,
+        log_file=log_file,
+        session_name=tmux_session_name,
+    )
+    script_content = _build_background_script(
+        command=command,
+        cwd=resolved_cwd,
+        session_name=tmux_session_name,
+        log_file=command_log,
+    )
+    tmux_cmd = _build_tmux_new_session_command(
+        tmux_session_name,
+        script_path=_background_script_path(watch_log, tmux_session_name),
+        script_content=script_content,
     )
 
-    if cwd.strip():
-        inner = f"cd {shlex.quote(cwd)} && " + inner
-
-    tmux_cmd = (
-        f"tmux new-session -d -s {shlex.quote(tmux_session_name)} "
-        f"'bash -c {shlex.quote(inner)}'"
-    )
-
-    result = _exec_on_channel(client, tmux_cmd, timeout_s=15, max_output_chars=2000)
+    launch_recovered = False
+    launch_check = None
+    result = _exec_on_channel(client, tmux_cmd, timeout_s=30, max_output_chars=2000)
     if result["exit_code"] != 0:
-        stderr = result.get("stderr", "")
-        stdout = result.get("stdout", "")
-        combined = (stderr + "\n" + stdout).lower()
+        if result.get("timed_out") or result.get("connection_error"):
+            try:
+                launch_check = check_background_task(
+                    tmux_session=tmux_session_name,
+                    log_file=watch_log,
+                    sandbox_name=session.id,
+                    last_n_lines=20,
+                )
+            except Exception:
+                launch_check = None
+        if isinstance(launch_check, dict):
+            log_tail = str(launch_check.get("log_tail", ""))
+            if launch_check.get("running") or launch_check.get("exit_code") is not None or (
+                log_tail and "[log file not found]" not in log_tail
+            ):
+                launch_recovered = True
+                result["exit_code"] = 0
+                result["stdout"] = launch_check.get("log_tail", "")
+        if not launch_recovered:
+            stderr = result.get("stderr", "")
+            stdout = result.get("stdout", "")
+            combined = (stderr + "\n" + stdout).lower()
 
-        if result.get("timed_out"):
-            diagnosis = (
-                "The tmux startup command itself timed out (15 s). "
-                "The remote host may be under heavy load or the shell is hanging on login. "
-                "Try running exec_bash('tmux new-session -d -s test echo ok') to diagnose."
-            )
-        elif result.get("connection_error"):
-            diagnosis = f"SSH connection error while launching tmux: {stderr.strip()}"
-        elif "duplicate session" in combined or "already exists" in combined:
-            diagnosis = (
-                f"A tmux session named {tmux_session_name!r} already exists on the remote host. "
-                "Use a different session_name or kill the existing session first with: "
-                f"tmux kill-session -t {tmux_session_name}"
-            )
-        elif "command not found" in combined or "no tmux" in combined:
-            diagnosis = (
-                "tmux is not installed on the remote host. "
-                "Install it with: sudo apt-get install tmux  (Debian/Ubuntu) "
-                "or: sudo yum install tmux  (CentOS/RHEL)"
-            )
-        else:
-            diagnosis = (
-                "Unknown failure. Check stderr/stdout above for details. "
-                "Common causes: tmux not installed, duplicate session name, "
-                "or permission denied on the log directory."
-            )
+            if result.get("timed_out"):
+                diagnosis = (
+                    "The tmux startup command itself timed out (30 s). "
+                    "The remote host may be under heavy load or the shell is hanging on login. "
+                    "Try running exec_bash('tmux new-session -d -s test echo ok') to diagnose."
+                )
+            elif result.get("connection_error"):
+                diagnosis = f"SSH connection error while launching tmux: {stderr.strip()}"
+            elif "duplicate session" in combined or "already exists" in combined:
+                diagnosis = (
+                    f"A tmux session named {tmux_session_name!r} already exists on the remote host. "
+                    "Use a different session_name or kill the existing session first with: "
+                    f"tmux kill-session -t {tmux_session_name}"
+                )
+            elif "command not found" in combined or "no tmux" in combined:
+                diagnosis = (
+                    "tmux is not installed on the remote host. "
+                    "Install it with: sudo apt-get install tmux  (Debian/Ubuntu) "
+                    "or: sudo yum install tmux  (CentOS/RHEL)"
+                )
+            else:
+                diagnosis = (
+                    "Unknown failure. Check stderr/stdout above for details. "
+                    "Common causes: tmux not installed, duplicate session name, "
+                    "or permission denied on the log directory."
+                )
 
-        return {
-            "error": "Failed to start background task in tmux",
-            "diagnosis": diagnosis,
-            "stderr": stderr,
-            "stdout": stdout,
-            "exit_code": result["exit_code"],
-            "timed_out": result.get("timed_out", False),
-            "connection_error": result.get("connection_error", False),
-        }
+            return {
+                "error": "Failed to start background task in tmux",
+                "diagnosis": diagnosis,
+                "stderr": stderr,
+                "stdout": stdout,
+                "exit_code": result["exit_code"],
+                "timed_out": result.get("timed_out", False),
+                "connection_error": result.get("connection_error", False),
+                "launch_check": launch_check,
+            }
     task = {
         "status": "started",
         "tmux_session": tmux_session_name,
-        "log_file": log,
+        "log_file": watch_log,
         "sandbox": session.id,
-        "note": (
+    }
+    if launch_recovered:
+        task["launch_recovered"] = True
+        task["launch_check"] = launch_check
+        task["note"] = (
+            "Task appears to have started even though the launch command did not return cleanly. "
+            "Call check_background_task to poll progress."
+        )
+    else:
+        task["note"] = (
             "Task is running in background. "
             "Call check_background_task with this tmux_session and log_file to poll progress."
-        ),
-    }
+        )
     if not watch:
         return task
 
@@ -1226,11 +1444,11 @@ def exec_bash_background(
         sandbox_name=sandbox_name or task["sandbox"],
         run_id=run_id.strip() or task["tmux_session"],
         name=watch_name,
-        cwd=cwd,
+        cwd=resolved_cwd,
         launch_command=command,
         resume_command=resume_command,
         resume_plan_json=resume_plan_json,
-        checkpoint_path=checkpoint_path,
+        checkpoint_path=_resolve_watch_path(session, resolved_cwd, checkpoint_path),
         checkpoint_format=checkpoint_format,
         checkpoint_command=checkpoint_command,
         interval_s=interval_s,
@@ -1301,6 +1519,8 @@ def check_background_task(
 
     session = _get_session(resolved_sandbox)
     client = session.ensure_connected()
+    if resolved_log_file:
+        resolved_log_file = _expand_remote_user_path(session, resolved_log_file)
 
     # Check if the tmux session exists
     check_cmd = (
@@ -1633,15 +1853,19 @@ def watch_background_task(
     sandbox = sandbox_name.strip() or _ACTIVE_SANDBOX
     if not sandbox:
         raise ValueError("sandbox_name is required when no active sandbox is selected")
+    session = _get_session(sandbox)
+    resolved_cwd = _expand_remote_user_path(session, cwd)
+    resolved_log_file = _resolve_watch_path(session, resolved_cwd, log_file)
+    resolved_checkpoint_path = _resolve_watch_path(session, resolved_cwd, checkpoint_path)
 
     metadata = _parse_json_object(metadata_json, "metadata_json")
     effective_resume_command, resume_plan = _prepare_resume_plan(
         launch_command=launch_command,
         resume_command=resume_command,
-        checkpoint_path=checkpoint_path,
+        checkpoint_path=resolved_checkpoint_path,
         checkpoint_format=checkpoint_format,
         checkpoint_command=checkpoint_command,
-        cwd=cwd,
+        cwd=resolved_cwd,
         resume_plan_json=resume_plan_json,
         auto_resume=auto_resume,
     )
@@ -1650,14 +1874,14 @@ def watch_background_task(
     watch = create_watch(
         sandbox,
         tmux_session,
-        log_file,
+        resolved_log_file,
         run_id=run_id.strip() or tmux_session.strip(),
         name=name,
-        cwd=cwd,
+        cwd=resolved_cwd,
         launch_command=launch_command,
         resume_command=effective_resume_command,
         resume_plan=resume_plan,
-        checkpoint_path=checkpoint_path.strip() or str(resume_plan.get("checkpoint_path", "")),
+        checkpoint_path=resolved_checkpoint_path or str(resume_plan.get("checkpoint_path", "")),
         checkpoint_format=str(resume_plan.get("checkpoint_format", checkpoint_format or "text")),
         checkpoint_command=checkpoint_command.strip() or str(resume_plan.get("checkpoint_command", "")),
         interval_s=interval_s,
