@@ -502,6 +502,28 @@ def _query_resources(session: SandboxSession) -> dict:
         return {"error": str(exc)}
 
 
+def _probe_connection_status(session: SandboxSession) -> dict[str, object]:
+    """Return whether a sandbox is currently usable for the next command.
+
+    Unlike ``is_alive()``, this may reconnect when the cached transport is stale,
+    so it better reflects what users care about: whether the MCP can execute now.
+    """
+    try:
+        client = session.ensure_connected()
+        transport = client.get_transport()
+        if transport is None or not transport.is_active():
+            session.mark_broken()
+            return {"alive": False, "error": "SSH transport is not active"}
+        try:
+            transport.send_ignore()
+        except Exception as exc:
+            session.mark_broken()
+            return {"alive": False, "error": str(exc)}
+        return {"alive": True}
+    except Exception as exc:
+        return {"alive": False, "error": str(exc)}
+
+
 def _remote_home(session: SandboxSession) -> str:
     cached = _REMOTE_HOME_CACHE.get(session.id)
     if cached:
@@ -1148,14 +1170,17 @@ def list_sandboxes(check_resources: bool = False) -> dict:
         }
     sandboxes = []
     for name, session in sessions.items():
+        connection = _probe_connection_status(session)
         info: dict = {
             "name": name,
             "host": session.config.host,
             "port": session.config.port,
             "user": session.config.user,
             "is_active": name == _ACTIVE_SANDBOX,
-            "connection_alive": session.is_alive(),
+            "connection_alive": bool(connection["alive"]),
         }
+        if not connection["alive"]:
+            info["connection_error"] = str(connection.get("error", ""))
         if check_resources:
             info["resources"] = _query_resources(session)
         sandboxes.append(info)
@@ -1197,12 +1222,18 @@ def get_active_sandbox() -> dict:
         session = _SESSIONS.get(_ACTIVE_SANDBOX)
     if session is None:
         return {"active_sandbox": _ACTIVE_SANDBOX, "error": "Session object not found"}
+    connection = _probe_connection_status(session)
     return {
         "active_sandbox": _ACTIVE_SANDBOX,
         "host": session.config.host,
         "port": session.config.port,
         "user": session.config.user,
-        "connection_alive": session.is_alive(),
+        "connection_alive": bool(connection["alive"]),
+        **(
+            {"connection_error": str(connection.get("error", ""))}
+            if not connection["alive"]
+            else {}
+        ),
     }
 
 
