@@ -20,6 +20,12 @@ call `list_sandboxes(check_resources=True)` again and switch with `select_sandbo
 Use a stable remote project root, e.g. `~/sandboxes/<project-name>`, and a unique run ID
 (timestamp or task ID). All paths below are relative to this root.
 
+For any long-running task, reserve these paths up front:
+- `logs/<run_id>.log`
+- `checkpoints/<run_id>.json`
+- `scripts/run_<run_id>.sh`
+- `scripts/resume_<run_id>.sh`
+
 ## Step 2 – Bootstrap Runtime with uv
 
 Run a remote setup command through `exec_bash`:
@@ -32,60 +38,54 @@ Run a remote setup command through `exec_bash`:
 Call `sync_local_to_remote` before execution.
 Exclude heavy/unnecessary paths (`.git`, `node_modules`, caches, build outputs).
 
-## Step 4 – Define Checkpoint + Resume Plan (required for long tasks)
-
-Before starting any long task, define these artifacts explicitly:
-
-- `run_id`: stable identifier for the task
-- `checkpoint_path` or `checkpoint_command`: how progress is persisted and read
-- `resume_command`: the command that resumes from the latest checkpoint
-- `resume_plan`: a structured JSON object that at minimum includes the checkpoint and resume command
-
-Do **not** rely on "let the agent inspect the failure later and invent a new script".
-When the server is down, that is impossible. The recovery plan must already exist before launch.
-
-Checkpoint guidance:
-- Prefer a single machine-readable file such as `run_state.json`, `progress.json`, or a text checkpoint file
-- Update it periodically during execution
-- Make sure the content is enough to decide whether resuming is safe
-
-Resume plan guidance:
-- Prefer an idempotent `resume_command`
-- Make it safe to run more than once
-- It should continue from checkpoint, not restart blindly unless restart is intended
-
-## Step 5 – Execute Task
+## Step 4 – Execute Task
 
 **Short tasks (< 2 minutes):** use `exec_bash` with `tee` to a log file.
 
-**Long tasks (training, batch jobs, slow builds):** prefer `exec_bash_background_watch`
-instead of raw `exec_bash_background`. This starts the tmux task and registers the local
-watchdog in one step, including `run_id`, checkpoint metadata, and resume plan.
-Never block with `exec_bash` on jobs that may exceed its timeout.
+**Long tasks (training, batch jobs, slow builds):** before starting anything, the agent must
+materialize a checkpoint-aware run script and a resume script. This is mandatory, not optional.
+Do not launch a long job as an inline one-liner unless the task is disposable and the user has
+explicitly waived resume support.
+
+Required preflight for every long task:
+1. Write `scripts/run_<run_id>.sh`. It should emit progress logs and update `checkpoints/<run_id>.json`
+   after each meaningful unit of work.
+2. Write `scripts/resume_<run_id>.sh`. It should read the checkpoint file, skip completed work,
+   and continue only the unfinished portion.
+3. Choose a concrete `checkpoint_path` and keep its format stable, preferably JSON.
+4. Start the job with `exec_bash_background(command=\"bash scripts/run_<run_id>.sh\", auto_resume=true, resume_command=\"bash scripts/resume_<run_id>.sh\", checkpoint_path=..., checkpoint_format=...)`.
+
+`exec_bash_background` remains the default long-task entrypoint after these files exist. It
+starts the detached tmux job, records logs, ensures the local watchdog is available, and returns
+a `watch_id` for later queries. Never block with `exec_bash` on jobs that may exceed its timeout.
 
 ### Long-Task Reliability Loop (required)
 
-After starting a long task, rely on the local watchdog daemon as the persistent poller.
-During the active Codex turn, inspect progress with:
+For long tasks, the agent should use this exact control flow:
 
-- `get_background_watch_progress`
-- `read_background_watch_log`
-- `read_background_watch_checkpoint`
+1. First create the checkpoint file contract plus `run_<run_id>.sh` and `resume_<run_id>.sh`.
+2. Start the job with `exec_bash_background(...)`.
+3. Save the returned `watch_id`. This is the primary query handle.
+4. Poll with `check_background_task(watch_id=<watch_id>)` until the task reaches a terminal state.
+5. Read `running`, `exit_code`, `log_tail`, and the embedded `watch` snapshot from each poll.
+6. Stop only when `running=false` and the final status is clear.
 
-Do not depend on waking another Codex instance to recover the task. The watchdog should
-only need the predefined checkpoint and resume plan.
+Use `tmux_session` or `log_file` only as secondary debugging aids. For normal operation,
+query by `watch_id` instead of rebuilding state manually from tmux.
 
-If polling fails due to timeout, transient network failure, or SSH connection interruption:
-- Call `get_active_sandbox` to verify connection health.
-- Retry polling after a short backoff.
-- If needed, re-select the same sandbox with `select_sandbox`, then continue polling.
+If polling fails because of timeout, transient network failure, or SSH reconnection:
+- Call `get_active_sandbox` to probe current connectivity.
+- Re-select the same sandbox with `select_sandbox` if needed.
+- Continue polling with the same `watch_id`; do not start a duplicate job unless you have
+  confirmed the original one is gone.
 
-If the server rebooted and the task/session is interrupted:
-- Read the latest checkpoint and log via the progress tools.
-- Use the predefined `resume_plan` to determine the next action.
-- Resume with the predefined `resume_command`; do not invent a fresh plan after failure unless the user explicitly asks for intervention.
+For long tasks, checkpoint-aware recovery is the default requirement. Pass `auto_resume=true`
+together with `resume_command` and checkpoint metadata when calling `exec_bash_background`.
+The tool's watchdog handles interrupted-session monitoring and resume attempts internally. The
+agent's job is to create the required files first, then keep querying `check_background_task(watch_id=...)`
+and report the resulting state.
 
-## Step 6 – Inspect Results
+## Step 5 – Inspect Results
 
 Use `read_remote_file` to inspect logs and `list_remote_files` to check artifacts.
 If output artifacts are needed locally, call `sync_remote_to_local`.
@@ -96,13 +96,10 @@ If output artifacts are needed locally, call `sync_remote_to_local`.
 |------|-------------|
 | `list_sandboxes` | Discover available sandboxes and compare load |
 | `select_sandbox` | Switch active sandbox for the session |
-| `get_active_sandbox` | Verify connection health before a long task |
+| `get_active_sandbox` | Verify or re-probe connection health during polling |
 | `exec_bash` | Short commands, setup, quick checks |
-| `exec_bash_background_watch` | Preferred long-task launcher with watchdog, checkpoint, and resume plan |
-| `watch_background_task` | Register an existing tmux task with checkpoint and resume metadata |
-| `get_background_watch_progress` | Read stored + live task progress |
-| `read_background_watch_log` | Read the latest remote log tail for a managed task |
-| `read_background_watch_checkpoint` | Read the latest checkpoint snapshot for a managed task |
+| `exec_bash_background` | Start any long-running task and register monitoring |
+| `check_background_task` | Poll a background task by `watch_id` and read progress/logs |
 | `sync_local_to_remote` | Push code to remote before execution |
 | `read_remote_file` | Inspect log files or output files |
 | `list_remote_files` | Browse outputs and verify files exist |
@@ -112,15 +109,19 @@ If output artifacts are needed locally, call `sync_remote_to_local`.
 
 - Prefer idempotent setup commands so repeated runs are safe.
 - Keep one log file per run ID; include command and timestamp in the log header.
-- For long tasks, establish `checkpoint + resume_plan` before launch; this is mandatory.
 - If a command fails, capture the exit code and include the failing log section in the response.
 - If remote setup fails, stop and report the exact failing command plus stderr.
 - Only skip this workflow when the user explicitly requests local execution.
-- For long tasks, do NOT wait – use `exec_bash_background_watch` when possible.
-- Check connection health with `get_active_sandbox` before starting any long task.
-- Use `get_background_watch_progress` to inspect current task state during the turn.
-- On timeout/connection interruption during polling, reconnect and continue polling instead of abandoning the run.
-- If task interruption is caused by host reboot/session loss, resume from the predefined checkpoint-aware plan rather than generating a new ad-hoc plan.
+- For long tasks, first create a checkpoint file plus both `run_<run_id>.sh` and `resume_<run_id>.sh`. Do not skip this unless the user explicitly says resume is unnecessary.
+- The main long-task script must write observable progress and update the checkpoint after each meaningful step.
+- The resume script must read the checkpoint and continue only unfinished work.
+- For long tasks, do NOT wait. Start with `exec_bash_background`, with `auto_resume=true`, then query only with `check_background_task(watch_id=...)`.
+- Treat the returned `watch_id` as the canonical handle for the run.
+- `exec_bash_background` already handles detached tmux launch, log capture, and watchdog setup. Do not add a separate manual monitoring workflow unless debugging the MCP itself.
+- Check connection health with `get_active_sandbox` before starting a long task and again if polling errors occur.
+- For long tasks, continuously poll until terminal state (`running=false` and `exit_code` available).
+- On timeout or connection interruption during polling, reconnect and continue polling the same `watch_id` instead of abandoning the run.
+- Provide `auto_resume` plus resume/checkpoint inputs up front and let the tool manage the interrupted -> resume flow.
 
 ## Command Templates
 

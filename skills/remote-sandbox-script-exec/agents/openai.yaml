@@ -1,4 +1,4 @@
 interface:
   display_name: "Remote Sandbox Exec"
-  short_description: "Run tasks in SSH sandbox with uv and synced logs"
-  default_prompt: "Use $remote-sandbox-script-exec to run this task in the SSH sandbox: setup uv, sync code, execute with tee logs, and inspect outputs."
+  short_description: "Run remote tasks with forced checkpoint/resume scripts"
+  default_prompt: "Use $remote-sandbox-script-exec to run this task in the SSH sandbox. For any long job, first write a checkpoint-updating run script and a checkpoint-aware resume script, then start it with exec_bash_background(auto_resume=true) and keep querying check_background_task by watch_id until completion."
