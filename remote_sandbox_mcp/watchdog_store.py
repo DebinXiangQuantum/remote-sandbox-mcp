@@ -191,6 +191,30 @@ def init_db(path: str = "") -> dict[str, Any]:
             CREATE INDEX IF NOT EXISTS idx_watch_events_watch
             ON watch_events(watch_id, created_ts DESC);
 
+            CREATE TABLE IF NOT EXISTS transfer_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction TEXT NOT NULL,
+                sandbox_name TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                remote_path TEXT NOT NULL,
+                delete_extras INTEGER NOT NULL DEFAULT 0,
+                excludes_json TEXT NOT NULL DEFAULT '[]',
+                exclude_file TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'queued',
+                pid INTEGER NOT NULL DEFAULT 0,
+                log_file TEXT NOT NULL DEFAULT '',
+                started_ts INTEGER NOT NULL DEFAULT 0,
+                finished_ts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                progress_json TEXT NOT NULL DEFAULT '{}',
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transfer_tasks_status
+            ON transfer_tasks(status, id DESC);
+
             CREATE TABLE IF NOT EXISTS daemon_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -199,6 +223,7 @@ def init_db(path: str = "") -> dict[str, Any]:
             """
         )
         _ensure_watch_columns(conn)
+        _ensure_transfer_task_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -233,6 +258,26 @@ def _decode_event(row: sqlite3.Row | None) -> dict[str, Any] | None:
         item["payload"] = json.loads(item.pop("payload_json", "{}") or "{}")
     except json.JSONDecodeError:
         item["payload"] = {}
+    return item
+
+
+def _decode_transfer_task(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    item = dict(row)
+    try:
+        item["excludes"] = json.loads(item.pop("excludes_json", "[]") or "[]")
+    except json.JSONDecodeError:
+        item["excludes"] = []
+    try:
+        item["result"] = json.loads(item.pop("result_json", "{}") or "{}")
+    except json.JSONDecodeError:
+        item["result"] = {}
+    try:
+        item["progress"] = json.loads(item.pop("progress_json", "{}") or "{}")
+    except json.JSONDecodeError:
+        item["progress"] = {}
+    item["delete_extras"] = bool(item.get("delete_extras", 0))
     return item
 
 
@@ -454,6 +499,125 @@ def record_event(
         conn.close()
 
 
+def create_transfer_task(
+    direction: str,
+    sandbox_name: str,
+    local_path: str,
+    remote_path: str,
+    *,
+    delete_extras: bool = False,
+    excludes: list[str] | None = None,
+    exclude_file: str = "",
+    log_file: str = "",
+    path: str = "",
+) -> dict[str, Any]:
+    now = int(time.time())
+    conn = _connect(path)
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO transfer_tasks (
+                direction, sandbox_name, local_path, remote_path, delete_extras,
+                excludes_json, exclude_file, status, log_file, created_ts, updated_ts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+            """,
+            (
+                direction.strip(),
+                sandbox_name.strip(),
+                local_path,
+                remote_path,
+                1 if delete_extras else 0,
+                json.dumps(excludes or [], ensure_ascii=True, separators=(",", ":")),
+                exclude_file.strip(),
+                log_file.strip(),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        task_id = int(cur.lastrowid)
+        return get_transfer_task(task_id, path=path) or {"id": task_id}
+    finally:
+        conn.close()
+
+
+def get_transfer_task(task_id: int, path: str = "") -> dict[str, Any] | None:
+    conn = _connect(path)
+    try:
+        row = conn.execute("SELECT * FROM transfer_tasks WHERE id = ?", (task_id,)).fetchone()
+        return _decode_transfer_task(row)
+    finally:
+        conn.close()
+
+
+def update_transfer_task(
+    task_id: int,
+    *,
+    path: str = "",
+    **fields: Any,
+) -> dict[str, Any]:
+    if not fields:
+        task = get_transfer_task(task_id, path=path)
+        if task is None:
+            raise ValueError(f"Unknown transfer task id: {task_id}")
+        return task
+    updates: dict[str, Any] = dict(fields)
+    if "excludes" in updates:
+        updates["excludes_json"] = json.dumps(
+            updates.pop("excludes") or [],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    if "result" in updates:
+        updates["result_json"] = json.dumps(
+            updates.pop("result") or {},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    if "progress" in updates:
+        updates["progress_json"] = json.dumps(
+            updates.pop("progress") or {},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    if "delete_extras" in updates:
+        updates["delete_extras"] = 1 if updates["delete_extras"] else 0
+    updates["updated_ts"] = int(time.time())
+
+    columns = ", ".join(f"{key} = ?" for key in updates.keys())
+    values = list(updates.values())
+    values.append(task_id)
+    conn = _connect(path)
+    try:
+        cur = conn.execute(f"UPDATE transfer_tasks SET {columns} WHERE id = ?", values)
+        if cur.rowcount == 0:
+            raise ValueError(f"Unknown transfer task id: {task_id}")
+        conn.commit()
+        row = conn.execute("SELECT * FROM transfer_tasks WHERE id = ?", (task_id,)).fetchone()
+        return _decode_transfer_task(row) or {"id": task_id}
+    finally:
+        conn.close()
+
+
+def list_transfer_tasks(
+    *,
+    status: str = "",
+    path: str = "",
+) -> list[dict[str, Any]]:
+    conn = _connect(path)
+    try:
+        if status.strip():
+            rows = conn.execute(
+                "SELECT * FROM transfer_tasks WHERE status = ? ORDER BY id DESC",
+                (status.strip(),),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM transfer_tasks ORDER BY id DESC").fetchall()
+        return [_decode_transfer_task(row) for row in rows if row is not None]
+    finally:
+        conn.close()
+
+
 def list_events(
     *,
     watch_id: int = 0,
@@ -569,3 +733,33 @@ def _ensure_watch_columns(conn: sqlite3.Connection) -> None:
         if column in existing:
             continue
         conn.execute(f"ALTER TABLE watches ADD COLUMN {column} {ddl}")
+
+
+def _ensure_transfer_task_columns(conn: sqlite3.Connection) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(transfer_tasks)").fetchall()
+    }
+    required = {
+        "direction": "TEXT NOT NULL DEFAULT ''",
+        "sandbox_name": "TEXT NOT NULL DEFAULT ''",
+        "local_path": "TEXT NOT NULL DEFAULT ''",
+        "remote_path": "TEXT NOT NULL DEFAULT ''",
+        "delete_extras": "INTEGER NOT NULL DEFAULT 0",
+        "excludes_json": "TEXT NOT NULL DEFAULT '[]'",
+        "exclude_file": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'queued'",
+        "pid": "INTEGER NOT NULL DEFAULT 0",
+        "log_file": "TEXT NOT NULL DEFAULT ''",
+        "started_ts": "INTEGER NOT NULL DEFAULT 0",
+        "finished_ts": "INTEGER NOT NULL DEFAULT 0",
+        "last_error": "TEXT NOT NULL DEFAULT ''",
+        "result_json": "TEXT NOT NULL DEFAULT '{}'",
+        "progress_json": "TEXT NOT NULL DEFAULT '{}'",
+        "created_ts": "INTEGER NOT NULL DEFAULT 0",
+        "updated_ts": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, ddl in required.items():
+        if column in existing:
+            continue
+        conn.execute(f"ALTER TABLE transfer_tasks ADD COLUMN {column} {ddl}")

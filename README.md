@@ -178,7 +178,7 @@ remote-sandbox-mcp
 默认公开的 MCP 工具只有这几类：
 - 沙箱管理：`list_sandboxes`、`select_sandbox`、`get_active_sandbox`
 - 命令执行：`exec_bash`、`exec_bash_background`、`check_background_task`
-- 文件操作：`list_remote_files`、`read_remote_file`、`sync_local_to_remote`、`sync_remote_to_local`
+- 文件操作：`list_remote_files`、`read_remote_file`、`sync_local_to_remote`、`sync_local_to_remote_background`、`check_file_transfer_task`、`sync_remote_to_local`
 
 这样可以把工具列表压到最小，减少 Agent 的上下文负担。
 watchdog 相关的高级运维工具默认**不暴露**；`exec_bash_background()` 会在内部自动使用它们。
@@ -211,6 +211,10 @@ export REMOTE_SANDBOX_EXPOSE_ADVANCED_TOOLS=1
 
 #### `exec_bash`
 在远端执行 bash 命令，适合短任务（< 2 分钟）。
+
+注意：
+- MCP Client 往往会对单次 `tools/call` 施加额外超时，常见值约为 120 秒。
+- 因此 `exec_bash` 更适合“明显短于 120 秒”的命令；长任务请改用 `exec_bash_background`。
 
 参数：
 - `command` (str, 必填)
@@ -427,8 +431,40 @@ python train.py \
 读取远程文件。参数：`remote_path`, `max_bytes`, `sandbox_name`
 
 #### `sync_local_to_remote`
+这是一个同步型 SFTP 调用：只有整次上传完成后才会返回结果。
+
+注意：
+- 如果目录很大、文件很多，或网络 RTT 较高，MCP Client 可能先在 `tools/call` 层超时。
+- 建议配合 `excludes` / `exclude_file` 排除大目录，或按子目录分批同步。
 本地文件或目录同步到远端（SFTP，增量）。
 参数：`local_path`, `remote_path`, `delete_extras`, `excludes`, `exclude_file`, `sandbox_name`
+
+#### `sync_local_to_remote_background`
+在本机启动一个脱离 MCP `stdio` 生命周期的后台 worker，执行本地到远端的同步。
+
+适用场景：
+- 目录较大，单次 `tools/call` 容易超过 120 秒
+- 需要轮询状态，而不是阻塞等待整次同步结束
+
+返回字段：
+- `task_id`：本次后台同步任务 ID
+- `pid`：本地 worker 进程号
+- `log_file`：本地日志文件路径
+
+参数：`local_path`, `remote_path`, `delete_extras`, `excludes`, `exclude_file`, `sandbox_name`
+
+#### `check_file_transfer_task`
+查询一个后台文件同步任务的状态，并返回本地日志尾部。
+
+返回字段：
+- `status`：`queued` / `running` / `completed` / `failed`
+- `running`：worker 仍在运行时为 `true`
+- `pending`：任务已创建但 worker 还未进入运行态时为 `true`
+- `stale`：数据库仍是 `running`，但 worker 进程已经不存在
+- `task.progress`：最近一次写入的进度快照
+- `log_tail`：本地日志尾部
+
+参数：`task_id`, `last_n_lines`
 
 #### `sync_remote_to_local`
 远端文件或目录同步到本地（SFTP，增量）。

@@ -9,9 +9,11 @@ import posixpath
 import shutil
 import shlex
 import stat
+import subprocess
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -32,14 +34,17 @@ from remote_sandbox_mcp.watchdog_store import (
     HEARTBEAT_STALE_S,
     config_path as watchdog_config_path,
     create_watch,
+    create_transfer_task,
     db_path as watchdog_db_path,
     get_daemon_meta,
+    get_transfer_task,
     get_watch,
     init_db as init_watchdog_db,
     list_events as list_watchdog_events,
     list_watches as list_watchdog_watches,
     save_sandbox_config,
     cancel_watch as cancel_watchdog_watch,
+    update_transfer_task,
 )
 
 mcp = FastMCP("remote-sandbox")
@@ -83,6 +88,8 @@ DEFAULT_EXCLUDES = [
 _CONNECT_TIMEOUT = 15.0
 _HEALTH_CHECK_INTERVAL = 30.0  # seconds between keep-alive probes
 _SSH_KEEPALIVE_INTERVAL_S = 15  # seconds between Paramiko keepalives
+_CHANNEL_OPEN_TIMEOUT = 15.0
+_SFTP_CHANNEL_TIMEOUT = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +526,22 @@ def _probe_connection_status(session: SandboxSession) -> dict[str, object]:
         except Exception as exc:
             session.mark_broken()
             return {"alive": False, "error": str(exc)}
+        channel = None
+        try:
+            channel = _open_ssh_session(
+                transport,
+                open_timeout_s=_CHANNEL_OPEN_TIMEOUT,
+                channel_timeout_s=_CHANNEL_OPEN_TIMEOUT,
+            )
+        except Exception as exc:
+            session.mark_broken()
+            return {"alive": False, "error": f"SSH channel open failed: {exc}"}
+        finally:
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
         return {"alive": True}
     except Exception as exc:
         return {"alive": False, "error": str(exc)}
@@ -687,6 +710,37 @@ def _is_retriable_transport_error(exc: Exception) -> bool:
     )
 
 
+def _open_ssh_session(
+    transport: paramiko.Transport,
+    *,
+    open_timeout_s: float,
+    channel_timeout_s: float,
+):
+    channel = transport.open_session(timeout=open_timeout_s)
+    channel.settimeout(float(channel_timeout_s))
+    return channel
+
+
+def _open_sftp_client(client: paramiko.SSHClient) -> paramiko.SFTPClient:
+    transport = client.get_transport()
+    if transport is None or not transport.is_active():
+        raise ConnectionError("SSH transport is not active; the connection may have dropped")
+    channel = _open_ssh_session(
+        transport,
+        open_timeout_s=_CHANNEL_OPEN_TIMEOUT,
+        channel_timeout_s=_SFTP_CHANNEL_TIMEOUT,
+    )
+    try:
+        channel.invoke_subsystem("sftp")
+        return paramiko.SFTPClient(channel)
+    except Exception:
+        try:
+            channel.close()
+        except Exception:
+            pass
+        raise
+
+
 def _exec_on_channel(
     client: paramiko.SSHClient,
     command: str,
@@ -724,8 +778,11 @@ def _exec_on_channel(
         channel = None
 
         try:
-            channel = transport.open_session()
-            channel.settimeout(float(timeout_s + 10))
+            channel = _open_ssh_session(
+                transport,
+                open_timeout_s=min(float(timeout_s + 10), _CHANNEL_OPEN_TIMEOUT),
+                channel_timeout_s=float(timeout_s + 10),
+            )
             channel.exec_command(wrapped)
 
             while True:
@@ -937,11 +994,27 @@ def _upload_tree(
     local_root: Path,
     remote_root: str,
     exclude_rules: list[str],
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> tuple[int, int, int, set[str]]:
     uploaded_files = 0
     skipped_files = 0
     uploaded_dirs = 0
     sent: set[str] = set()
+
+    def report(current_path: str = "") -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            {
+                "phase": "uploading",
+                "current_path": current_path,
+                "uploaded_dirs": uploaded_dirs,
+                "uploaded_files": uploaded_files,
+                "skipped_files": skipped_files,
+                "deleted_dirs": 0,
+                "deleted_files": 0,
+            }
+        )
 
     _ensure_remote_dir(sftp, remote_root)
 
@@ -963,6 +1036,7 @@ def _upload_tree(
         if rel_root:
             sent.add(rel_root)
             uploaded_dirs += 1
+            report(rel_root)
 
         for f in files:
             rel = f"{rel_root}/{f}".strip("/")
@@ -980,12 +1054,14 @@ def _upload_tree(
                 same_mtime = abs(int(remote_stat.st_mtime) - int(local_stat.st_mtime)) <= 1
                 if same_size and same_mtime:
                     skipped_files += 1
+                    report(rel)
                     continue
             except FileNotFoundError:
                 pass
             sftp.put(str(local_file), remote_file)
             sftp.utime(remote_file, (int(local_stat.st_atime), int(local_stat.st_mtime)))
             uploaded_files += 1
+            report(rel)
 
     return uploaded_dirs, uploaded_files, skipped_files, sent
 
@@ -1014,9 +1090,26 @@ def _safe_remove_remote_extras(
     remote_root: str,
     sent_paths: set[str],
     exclude_rules: list[str],
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> tuple[int, int]:
     deleted_files = 0
     deleted_dirs = 0
+
+    def report(current_path: str = "") -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            {
+                "phase": "deleting",
+                "current_path": current_path,
+                "uploaded_dirs": 0,
+                "uploaded_files": 0,
+                "skipped_files": 0,
+                "deleted_dirs": deleted_dirs,
+                "deleted_files": deleted_files,
+            }
+        )
+
     try:
         remote_files, remote_dirs = _walk_remote(sftp, remote_root)
     except FileNotFoundError:
@@ -1027,6 +1120,7 @@ def _safe_remove_remote_extras(
         if rel not in sent_paths:
             sftp.remove(posixpath.join(remote_root, rel))
             deleted_files += 1
+            report(rel)
     for rel in sorted(remote_dirs, key=lambda x: x.count("/"), reverse=True):
         if _is_excluded(rel, exclude_rules, is_dir=True):
             continue
@@ -1034,6 +1128,7 @@ def _safe_remove_remote_extras(
             try:
                 sftp.rmdir(posixpath.join(remote_root, rel))
                 deleted_dirs += 1
+                report(rel)
             except OSError:
                 pass
     return deleted_dirs, deleted_files
@@ -2192,6 +2287,308 @@ def list_background_watch_events(watch_id: int = 0, limit: int = 20) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Local transfer helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_local_input_path(path: str) -> Path:
+    expanded = Path(path).expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    return expanded.resolve()
+
+
+def _resolve_optional_local_file(path: str | None) -> str:
+    if not path or not path.strip():
+        return ""
+    return str(_resolve_local_input_path(path))
+
+
+def _transfer_runtime_dir() -> Path:
+    directory = Path(watchdog_db_path()).expanduser().parent / "transfers"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _transfer_log_path(task_id: int) -> Path:
+    return _transfer_runtime_dir() / f"transfer-{task_id}.log"
+
+
+def _tail_local_file(path: str, *, last_n_lines: int, max_chars: int = 20000) -> str:
+    if not path.strip():
+        return ""
+    target = Path(path).expanduser()
+    if not target.exists() or not target.is_file():
+        return ""
+    read_size = min(target.stat().st_size, max_chars * 4)
+    with target.open("rb") as fh:
+        if read_size > 0:
+            fh.seek(-read_size, os.SEEK_END)
+        data = fh.read()
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    tail = "\n".join(lines[-last_n_lines:])
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _sync_local_to_remote_impl(
+    *,
+    local_path: str = ".",
+    remote_path: str = ".",
+    delete_extras: bool = False,
+    excludes: list[str] | None = None,
+    exclude_file: str | None = None,
+    sandbox_name: str = "",
+    progress_callback: Optional[Callable[[dict], None]] = None,
+) -> dict:
+    local_root = _resolve_local_input_path(local_path)
+    if not local_root.exists():
+        raise ValueError(f"local_path does not exist: {local_root}")
+
+    remote_root = _normalize_remote(remote_path)
+    exclude_rules = _build_exclude_rules(excludes, exclude_file)
+    start = time.time()
+
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "phase": "connecting",
+                "current_path": "",
+                "uploaded_dirs": 0,
+                "uploaded_files": 0,
+                "skipped_files": 0,
+                "deleted_dirs": 0,
+                "deleted_files": 0,
+            }
+        )
+
+    session = _get_session(sandbox_name)
+    client = session.ensure_connected()
+    sftp = _open_sftp_client(client)
+    try:
+        if local_root.is_file():
+            if delete_extras:
+                raise ValueError("delete_extras is only supported when local_path is a directory")
+
+            candidates = _single_file_candidates(local_path, local_root)
+            if any(_is_excluded(candidate, exclude_rules) for candidate in candidates):
+                result = {
+                    "local_path": str(local_root),
+                    "remote_path": remote_root,
+                    "synced_type": "file",
+                    "uploaded_dirs": 0,
+                    "uploaded_files": 0,
+                    "skipped_files": 1,
+                    "deleted_dirs": 0,
+                    "deleted_files": 0,
+                    "delete_extras": False,
+                    "duration_s": round(time.time() - start, 3),
+                }
+                if progress_callback is not None:
+                    progress_callback({"phase": "complete", "current_path": local_root.name, **result})
+                return result
+
+            remote_file = _resolve_remote_file_target(sftp, remote_root, local_root.name)
+            _ensure_remote_dir(sftp, posixpath.dirname(remote_file))
+
+            local_stat = local_root.stat()
+            skipped_files = 0
+            uploaded_files = 0
+            try:
+                remote_stat = sftp.stat(remote_file)
+                same_size = remote_stat.st_size == local_stat.st_size
+                same_mtime = abs(int(remote_stat.st_mtime) - int(local_stat.st_mtime)) <= 1
+                if same_size and same_mtime:
+                    skipped_files = 1
+                else:
+                    sftp.put(str(local_root), remote_file)
+                    sftp.utime(remote_file, (int(local_stat.st_atime), int(local_stat.st_mtime)))
+                    uploaded_files = 1
+            except FileNotFoundError:
+                sftp.put(str(local_root), remote_file)
+                sftp.utime(remote_file, (int(local_stat.st_atime), int(local_stat.st_mtime)))
+                uploaded_files = 1
+
+            result = {
+                "local_path": str(local_root),
+                "remote_path": remote_file,
+                "synced_type": "file",
+                "uploaded_dirs": 0,
+                "uploaded_files": uploaded_files,
+                "skipped_files": skipped_files,
+                "deleted_dirs": 0,
+                "deleted_files": 0,
+                "delete_extras": False,
+                "duration_s": round(time.time() - start, 3),
+            }
+            if progress_callback is not None:
+                progress_callback({"phase": "complete", "current_path": local_root.name, **result})
+            return result
+
+        if not local_root.is_dir():
+            raise ValueError(f"local_path must be a file or directory: {local_root}")
+
+        uploaded_dirs, uploaded_files, skipped_files, sent = _upload_tree(
+            sftp,
+            local_root,
+            remote_root,
+            exclude_rules,
+            progress_callback=progress_callback,
+        )
+        deleted_dirs = 0
+        deleted_files = 0
+        if delete_extras:
+            deleted_dirs, deleted_files = _safe_remove_remote_extras(
+                sftp,
+                remote_root,
+                sent,
+                exclude_rules,
+                progress_callback=progress_callback,
+            )
+
+        result = {
+            "local_path": str(local_root),
+            "remote_path": remote_root,
+            "synced_type": "directory",
+            "uploaded_dirs": uploaded_dirs,
+            "uploaded_files": uploaded_files,
+            "skipped_files": skipped_files,
+            "deleted_dirs": deleted_dirs,
+            "deleted_files": deleted_files,
+            "delete_extras": delete_extras,
+            "duration_s": round(time.time() - start, 3),
+        }
+        if progress_callback is not None:
+            progress_callback({"phase": "complete", "current_path": "", **result})
+        return result
+    finally:
+        sftp.close()
+
+
+def _spawn_transfer_worker(task_id: int, log_file: str) -> subprocess.Popen:
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as log_handle:
+        return subprocess.Popen(
+            [sys.executable, "-m", "remote_sandbox_mcp.server", "transfer-worker", "--task-id", str(task_id)],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            start_new_session=True,
+            close_fds=True,
+        )
+
+
+def _run_transfer_worker(task_id: int) -> int:
+    db_path = str(watchdog_db_path())
+    init_watchdog_db(db_path)
+    task = get_transfer_task(task_id, path=db_path)
+    if task is None:
+        print(f"[transfer] unknown task id: {task_id}", flush=True)
+        return 2
+
+    if task.get("direction") != "local_to_remote":
+        update_transfer_task(
+            task_id,
+            path=db_path,
+            status="failed",
+            finished_ts=int(time.time()),
+            last_error=f"Unsupported transfer direction: {task.get('direction', '')}",
+        )
+        return 2
+
+    progress_state: dict = {
+        "phase": "starting",
+        "current_path": "",
+        "uploaded_dirs": 0,
+        "uploaded_files": 0,
+        "skipped_files": 0,
+        "deleted_dirs": 0,
+        "deleted_files": 0,
+    }
+    update_transfer_task(
+        task_id,
+        path=db_path,
+        status="running",
+        pid=os.getpid(),
+        started_ts=int(time.time()),
+        finished_ts=0,
+        last_error="",
+        progress=progress_state,
+    )
+
+    print(
+        f"[transfer] task={task_id} sandbox={task['sandbox_name']} "
+        f"local={task['local_path']} remote={task['remote_path']}",
+        flush=True,
+    )
+
+    last_flush = 0.0
+
+    def progress_callback(update: dict) -> None:
+        nonlocal last_flush
+        progress_state.update(update)
+        now = time.monotonic()
+        phase = str(update.get("phase", ""))
+        if phase not in {"complete", "failed"} and now - last_flush < 0.5:
+            return
+        last_flush = now
+        update_transfer_task(task_id, path=db_path, progress=progress_state)
+
+    try:
+        result = _sync_local_to_remote_impl(
+            local_path=task["local_path"],
+            remote_path=task["remote_path"],
+            delete_extras=bool(task.get("delete_extras")),
+            excludes=task.get("excludes", []),
+            exclude_file=task.get("exclude_file", ""),
+            sandbox_name=task["sandbox_name"],
+            progress_callback=progress_callback,
+        )
+        progress_state.update(result)
+        progress_state["phase"] = "complete"
+        update_transfer_task(
+            task_id,
+            path=db_path,
+            status="completed",
+            finished_ts=int(time.time()),
+            result=result,
+            progress=progress_state,
+            last_error="",
+        )
+        print(f"[transfer] task={task_id} completed", flush=True)
+        return 0
+    except Exception as exc:
+        progress_state["phase"] = "failed"
+        progress_state["current_path"] = progress_state.get("current_path", "")
+        error_text = f"{type(exc).__name__}: {exc}"
+        update_transfer_task(
+            task_id,
+            path=db_path,
+            status="failed",
+            finished_ts=int(time.time()),
+            last_error=error_text,
+            progress=progress_state,
+        )
+        print(f"[transfer] task={task_id} failed: {error_text}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        return 1
+
+
+# ---------------------------------------------------------------------------
 # MCP tools – file operations (updated to use persistent sessions)
 # ---------------------------------------------------------------------------
 
@@ -2211,7 +2608,7 @@ def list_remote_files(
     remote_path = _normalize_remote(remote_path)
     session = _get_session(sandbox_name)
     client = session.ensure_connected()
-    sftp = client.open_sftp()
+    sftp = _open_sftp_client(client)
     try:
         entries: list[dict] = []
 
@@ -2263,7 +2660,7 @@ def read_remote_file(
     remote_path = _normalize_remote(remote_path)
     session = _get_session(sandbox_name)
     client = session.ensure_connected()
-    sftp = client.open_sftp()
+    sftp = _open_sftp_client(client)
     try:
         with sftp.file(remote_path, "rb") as fh:
             data = fh.read(max_bytes + 1)
@@ -2291,98 +2688,135 @@ def sync_local_to_remote(
     sandbox_name: str = "",
 ) -> dict:
     """Sync local files/directories to the remote sandbox via SFTP."""
-    local_root = Path(local_path).resolve()
+    return _sync_local_to_remote_impl(
+        local_path=local_path,
+        remote_path=remote_path,
+        delete_extras=delete_extras,
+        excludes=excludes,
+        exclude_file=exclude_file,
+        sandbox_name=sandbox_name,
+    )
+
+
+@mcp.tool()
+@_safe_tool
+def sync_local_to_remote_background(
+    local_path: str = ".",
+    remote_path: str = ".",
+    delete_extras: bool = False,
+    excludes: list[str] | None = None,
+    exclude_file: str | None = None,
+    sandbox_name: str = "",
+) -> dict:
+    """Start a local-to-remote sync in a detached local worker process."""
+    local_root = _resolve_local_input_path(local_path)
     if not local_root.exists():
         raise ValueError(f"local_path does not exist: {local_root}")
+    if not local_root.is_file() and not local_root.is_dir():
+        raise ValueError(f"local_path must be a file or directory: {local_root}")
 
-    remote_root = _normalize_remote(remote_path)
-    exclude_rules = _build_exclude_rules(excludes, exclude_file)
+    resolved_exclude_file = _resolve_optional_local_file(exclude_file)
+    if resolved_exclude_file and not Path(resolved_exclude_file).is_file():
+        raise ValueError(f"exclude_file must be a file: {resolved_exclude_file}")
 
-    start = time.time()
     session = _get_session(sandbox_name)
-    client = session.ensure_connected()
-    sftp = client.open_sftp()
+    init_watchdog_db(str(watchdog_db_path()))
+    task = create_transfer_task(
+        "local_to_remote",
+        session.id,
+        str(local_root),
+        _normalize_remote(remote_path),
+        delete_extras=delete_extras,
+        excludes=list(excludes or []),
+        exclude_file=resolved_exclude_file,
+        path=str(watchdog_db_path()),
+    )
+
+    log_file = str(_transfer_log_path(task["id"]))
+    Path(log_file).write_text(
+        (
+            f"== transfer task: {task['id']}\n"
+            f"== created_at: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+            f"== sandbox: {session.id}\n"
+            f"== local_path: {local_root}\n"
+            f"== remote_path: {_normalize_remote(remote_path)}\n"
+        ),
+        encoding="utf-8",
+    )
+    update_transfer_task(
+        task["id"],
+        path=str(watchdog_db_path()),
+        log_file=log_file,
+        progress={
+            "phase": "queued",
+            "current_path": "",
+            "uploaded_dirs": 0,
+            "uploaded_files": 0,
+            "skipped_files": 0,
+            "deleted_dirs": 0,
+            "deleted_files": 0,
+        },
+    )
     try:
-        if local_root.is_file():
-            if delete_extras:
-                raise ValueError("delete_extras is only supported when local_path is a directory")
-
-            candidates = _single_file_candidates(local_path, local_root)
-            if any(_is_excluded(candidate, exclude_rules) for candidate in candidates):
-                return {
-                    "local_path": str(local_root),
-                    "remote_path": remote_root,
-                    "synced_type": "file",
-                    "uploaded_dirs": 0,
-                    "uploaded_files": 0,
-                    "skipped_files": 1,
-                    "deleted_dirs": 0,
-                    "deleted_files": 0,
-                    "delete_extras": False,
-                    "duration_s": round(time.time() - start, 3),
-                }
-
-            remote_file = _resolve_remote_file_target(sftp, remote_root, local_root.name)
-            _ensure_remote_dir(sftp, posixpath.dirname(remote_file))
-
-            local_stat = local_root.stat()
-            skipped_files = 0
-            uploaded_files = 0
-            try:
-                remote_stat = sftp.stat(remote_file)
-                same_size = remote_stat.st_size == local_stat.st_size
-                same_mtime = abs(int(remote_stat.st_mtime) - int(local_stat.st_mtime)) <= 1
-                if same_size and same_mtime:
-                    skipped_files = 1
-                else:
-                    sftp.put(str(local_root), remote_file)
-                    sftp.utime(remote_file, (int(local_stat.st_atime), int(local_stat.st_mtime)))
-                    uploaded_files = 1
-            except FileNotFoundError:
-                sftp.put(str(local_root), remote_file)
-                sftp.utime(remote_file, (int(local_stat.st_atime), int(local_stat.st_mtime)))
-                uploaded_files = 1
-
-            return {
-                "local_path": str(local_root),
-                "remote_path": remote_file,
-                "synced_type": "file",
-                "uploaded_dirs": 0,
-                "uploaded_files": uploaded_files,
-                "skipped_files": skipped_files,
-                "deleted_dirs": 0,
-                "deleted_files": 0,
-                "delete_extras": False,
-                "duration_s": round(time.time() - start, 3),
-            }
-
-        if not local_root.is_dir():
-            raise ValueError(f"local_path must be a file or directory: {local_root}")
-
-        uploaded_dirs, uploaded_files, skipped_files, sent = _upload_tree(
-            sftp, local_root, remote_root, exclude_rules
+        proc = _spawn_transfer_worker(task["id"], log_file)
+    except Exception:
+        update_transfer_task(
+            task["id"],
+            path=str(watchdog_db_path()),
+            status="failed",
+            finished_ts=int(time.time()),
+            last_error="Failed to spawn detached transfer worker",
         )
-        deleted_dirs = 0
-        deleted_files = 0
-        if delete_extras:
-            deleted_dirs, deleted_files = _safe_remove_remote_extras(
-                sftp, remote_root, sent, exclude_rules
-            )
+        raise
 
-        return {
-            "local_path": str(local_root),
-            "remote_path": remote_root,
-            "synced_type": "directory",
-            "uploaded_dirs": uploaded_dirs,
-            "uploaded_files": uploaded_files,
-            "skipped_files": skipped_files,
-            "deleted_dirs": deleted_dirs,
-            "deleted_files": deleted_files,
-            "delete_extras": delete_extras,
-            "duration_s": round(time.time() - start, 3),
-        }
-    finally:
-        sftp.close()
+    task = update_transfer_task(
+        task["id"],
+        path=str(watchdog_db_path()),
+        pid=proc.pid,
+    )
+    return {
+        "task_id": task["id"],
+        "status": task["status"],
+        "pid": proc.pid,
+        "sandbox": task["sandbox_name"],
+        "local_path": task["local_path"],
+        "remote_path": task["remote_path"],
+        "log_file": task["log_file"],
+        "note": (
+            "Transfer worker started in background. "
+            f"Call check_file_transfer_task(task_id={task['id']}) to poll progress."
+        ),
+    }
+
+
+@mcp.tool()
+@_safe_tool
+def check_file_transfer_task(task_id: int, last_n_lines: int = 50) -> dict:
+    """Return status and recent log output for one background file transfer task."""
+    if task_id <= 0:
+        raise ValueError("task_id must be positive")
+    if last_n_lines <= 0:
+        raise ValueError("last_n_lines must be positive")
+
+    init_watchdog_db(str(watchdog_db_path()))
+    task = get_transfer_task(task_id, path=str(watchdog_db_path()))
+    if task is None:
+        raise ValueError(f"Unknown transfer task id: {task_id}")
+
+    pid = int(task.get("pid", 0) or 0)
+    worker_alive = _pid_is_alive(pid) if pid > 0 else False
+    status = task.get("status", "")
+    stale = status == "running" and pid > 0 and not worker_alive and not task.get("finished_ts")
+    return {
+        "task_id": task_id,
+        "status": status,
+        "running": status == "running" and worker_alive,
+        "pending": status == "queued",
+        "worker_alive": worker_alive if pid > 0 else None,
+        "stale": stale,
+        "task": task,
+        "log_tail": _tail_local_file(task.get("log_file", ""), last_n_lines=last_n_lines),
+    }
 
 
 @mcp.tool()
@@ -2402,7 +2836,7 @@ def sync_remote_to_local(
     start = time.time()
     session = _get_session(sandbox_name)
     client = session.ensure_connected()
-    sftp = client.open_sftp()
+    sftp = _open_sftp_client(client)
     try:
         remote_attr = sftp.stat(remote_root)
         if stat.S_ISDIR(remote_attr.st_mode):
@@ -2482,6 +2916,12 @@ def main() -> None:
     daemon_parser.add_argument("--db", default=str(watchdog_db_path()))
     daemon_parser.add_argument("--loop-sleep", type=int, default=5)
 
+    transfer_worker_parser = subparsers.add_parser(
+        "transfer-worker",
+        help="Run one detached local file transfer worker",
+    )
+    transfer_worker_parser.add_argument("--task-id", type=int, required=True)
+
     args = parser.parse_args()
     if args.command == "daemon":
         WatchdogDaemon(
@@ -2490,6 +2930,8 @@ def main() -> None:
             loop_sleep_s=args.loop_sleep,
         ).run_forever()
         return
+    if args.command == "transfer-worker":
+        raise SystemExit(_run_transfer_worker(args.task_id))
 
     parser.error(f"unknown subcommand: {args.command}")
 
