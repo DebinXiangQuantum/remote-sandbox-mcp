@@ -102,10 +102,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_INLINE_SYNC_MAX_FILES = max(_env_int("REMOTE_SANDBOX_INLINE_SYNC_MAX_FILES", 10), 1)
-_INLINE_SYNC_MAX_BYTES = max(
+_INLINE_SYNC_MAX_FILES = min(_env_int("REMOTE_SANDBOX_INLINE_SYNC_MAX_FILES", 10), 10)
+_INLINE_SYNC_MAX_BYTES = min(
     _env_int("REMOTE_SANDBOX_INLINE_SYNC_MAX_BYTES", 1 * 1024 * 1024),
-    1,
+    1 * 1024 * 1024,
 )
 
 
