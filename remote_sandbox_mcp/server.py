@@ -6,6 +6,7 @@ import functools
 import json
 import os
 import posixpath
+import signal
 import shutil
 import shlex
 import stat
@@ -2379,6 +2380,56 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _is_terminal_transfer_status(status: str) -> bool:
+    return status in {"completed", "failed", "cancelled"}
+
+
+def _terminate_local_process_group(pid: int, force_kill_after_s: float = 5.0) -> dict:
+    if pid <= 0:
+        return {"terminated": False, "running": False}
+    if not _pid_is_alive(pid):
+        return {"terminated": False, "running": False}
+
+    target_pgid: int | None = None
+    if hasattr(os, "getpgid"):
+        try:
+            target_pgid = os.getpgid(pid)
+        except OSError:
+            return {"terminated": False, "running": False}
+
+    def send(sig: int) -> bool:
+        try:
+            if target_pgid is not None and hasattr(os, "killpg"):
+                os.killpg(target_pgid, sig)
+            else:
+                os.kill(pid, sig)
+            return True
+        except OSError:
+            return False
+
+    if not send(signal.SIGTERM):
+        return {"terminated": False, "running": False}
+
+    deadline = time.monotonic() + max(force_kill_after_s, 0.0)
+    while time.monotonic() < deadline:
+        if not _pid_is_alive(pid):
+            return {"terminated": True, "running": False}
+        time.sleep(0.1)
+
+    force_killed = send(signal.SIGKILL)
+    settle_deadline = time.monotonic() + 2.0
+    while time.monotonic() < settle_deadline:
+        if not _pid_is_alive(pid):
+            return {"terminated": True, "force_killed": True if force_killed else None, "running": False}
+        time.sleep(0.1)
+
+    return {
+        "terminated": True,
+        "force_killed": True if force_killed else None,
+        "running": True,
+    }
+
+
 def _validate_local_sync_request(
     local_path: str,
     exclude_file: str | None,
@@ -2607,6 +2658,9 @@ def _run_transfer_worker(task_id: int) -> int:
     if task is None:
         print(f"[transfer] unknown task id: {task_id}", flush=True)
         return 2
+    if task.get("status") == "cancelled":
+        print(f"[transfer] task={task_id} already cancelled", flush=True)
+        return 0
 
     if task.get("direction") != "local_to_remote":
         update_transfer_task(
@@ -2906,9 +2960,9 @@ def sync_local_to_remote(
     )
     return _compact_payload({"mode": "inline", **result})
 
-
-@mcp.tool()
-@_safe_tool
+#
+# Internal compatibility helper. Large transfers should normally enter through
+# sync_local_to_remote(), which auto-delegates to this path when needed.
 def sync_local_to_remote_background(
     local_path: str = ".",
     remote_path: str = ".",
@@ -2959,6 +3013,73 @@ def check_file_transfer_task(task_id: int, last_n_lines: int = 50) -> dict:
         "log_tail": _tail_local_file(task.get("log_file", ""), last_n_lines=last_n_lines),
     }
     return _compact_payload(payload)
+
+
+@mcp.tool()
+@_safe_tool
+def cancel_file_transfer_task(task_id: int, force_kill_after_s: float = 5.0) -> dict:
+    """Cancel one background file transfer task and stop its local worker if needed."""
+    if task_id <= 0:
+        raise ValueError("task_id must be positive")
+    if force_kill_after_s < 0:
+        raise ValueError("force_kill_after_s must be zero or positive")
+
+    db_path = str(watchdog_db_path())
+    init_watchdog_db(db_path)
+    task = get_transfer_task(task_id, path=db_path)
+    if task is None:
+        raise ValueError(f"Unknown transfer task id: {task_id}")
+
+    status = str(task.get("status", ""))
+    pid = int(task.get("pid", 0) or 0)
+    if _is_terminal_transfer_status(status):
+        return _compact_payload({
+            "task_id": task_id,
+            "status": status,
+            "already_finished": True,
+        })
+
+    termination = (
+        _terminate_local_process_group(pid, force_kill_after_s=force_kill_after_s)
+        if pid > 0
+        else {"terminated": False, "running": False}
+    )
+
+    latest = get_transfer_task(task_id, path=db_path) or task
+    latest_status = str(latest.get("status", ""))
+    if termination.get("running"):
+        return _compact_payload({
+            "task_id": task_id,
+            "status": latest_status or status or "running",
+            "terminated": termination.get("terminated"),
+            "force_killed": termination.get("force_killed"),
+            "error": "Worker still running after cancellation attempt",
+        })
+    if _is_terminal_transfer_status(latest_status):
+        return _compact_payload({
+            "task_id": task_id,
+            "status": latest_status,
+            "already_finished": True,
+            "terminated": termination.get("terminated"),
+            "force_killed": termination.get("force_killed"),
+        })
+
+    progress = dict(latest.get("progress") or {})
+    progress["phase"] = "cancelled"
+    updated = update_transfer_task(
+        task_id,
+        path=db_path,
+        status="cancelled",
+        finished_ts=int(time.time()),
+        last_error="",
+        progress=progress,
+    )
+    return _compact_payload({
+        "task_id": task_id,
+        "status": updated["status"],
+        "terminated": termination.get("terminated"),
+        "force_killed": termination.get("force_killed"),
+    })
 
 
 @mcp.tool()

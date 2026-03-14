@@ -9,7 +9,7 @@
 - **持久 SSH 会话**：每个沙箱维持一条长连接，自动健康检查与断线重连，不再每次调用新建连接
 - **可靠的超时控制**：双层超时（远端 `timeout` 命令 + 客户端 deadline）确保超时真的生效
 - **后台长任务**：通过 `exec_bash_background` 在 tmux 中运行长任务，默认自动登记 watchdog 并返回 `watch_id`
-- **智能文件传输**：`sync_local_to_remote` 默认只内联处理小传输；超过阈值会自动切到本机后台 worker，避免单次 `tools/call` 卡住。`sync_local_to_remote_background` 仍可显式强制走后台
+- **智能文件传输**：`sync_local_to_remote` 默认只内联处理小传输；超过阈值会自动切到本机后台 worker，避免单次 `tools/call` 卡住，并保留 `excludes` / `exclude_file` 规则
 - **macOS 守护监控**：本地 `launchd` watchdog 持续监控远端长任务，把状态写入 SQLite，在 SSH 连续失败后发本地通知，并在 tmux 丢失时按 checkpoint/resume 计划恢复
 - 本地文件/目录同步到远程沙箱（增量，按 `size + mtime` 跳过未变更文件）
 - 远程文件/目录同步回本地
@@ -185,7 +185,7 @@ remote-sandbox-mcp
 默认公开的 MCP 工具只有这几类：
 - 沙箱管理：`list_sandboxes`、`select_sandbox`、`get_active_sandbox`
 - 命令执行：`exec_bash`、`exec_bash_background`、`check_background_task`
-- 文件操作：`list_remote_files`、`read_remote_file`、`sync_local_to_remote`、`sync_local_to_remote_background`、`check_file_transfer_task`、`sync_remote_to_local`
+- 文件操作：`list_remote_files`、`read_remote_file`、`sync_local_to_remote`、`check_file_transfer_task`、`cancel_file_transfer_task`、`sync_remote_to_local`
 
 这样可以把工具列表压到最小，减少 Agent 的上下文负担。
 默认返回也会尽量精简：优先保留状态、ID、关键路径和必要日志，不重复回显输入参数，也不默认附带大块内部对象。
@@ -471,6 +471,7 @@ python train.py \
 行为：
 - 小传输才会内联执行，并在整次上传完成后直接返回结果
 - 工具会先扫描本地待传文件数量和总字节数
+- `excludes` / `exclude_file` 会同时作用于内联模式和自动切到后台后的实际上传
 - 只要超过以下任一阈值，就会自动切到后台 worker：
   `REMOTE_SANDBOX_INLINE_SYNC_MAX_FILES`，默认 `200`
   `REMOTE_SANDBOX_INLINE_SYNC_MAX_BYTES`，默认 `64 MiB`
@@ -487,28 +488,13 @@ python train.py \
 本地文件或目录同步到远端（SFTP，增量）。
 参数：`local_path`, `remote_path`, `delete_extras`, `excludes`, `exclude_file`, `sandbox_name`
 
-#### `sync_local_to_remote_background`
-显式强制走后台传输。在本机启动一个脱离 MCP `stdio` 生命周期的后台 worker，执行本地到远端的同步。
-
-适用场景：
-- 你明确知道这次传输不应该占用一次阻塞式 `tools/call`
-- 需要轮询状态，而不是等待 `sync_local_to_remote` 自动判断
-
-参数：`local_path`, `remote_path`, `delete_extras`, `excludes`, `exclude_file`, `sandbox_name`
-
-返回字段：
-- `task_id`：本次后台同步任务 ID
-- `status`：启动后通常为 `queued`
-- `pid`：本地 worker 进程号
-- `log_file`：本地日志文件路径
-
 #### `check_file_transfer_task`
 查询一个后台文件同步任务的状态，并返回本地日志尾部。
 
 参数：`task_id`, `last_n_lines`
 
 返回字段：
-- `status`：`queued` / `running` / `completed` / `failed`
+- `status`：`queued` / `running` / `completed` / `failed` / `cancelled`
 - `running`：仅当 worker 仍在运行时返回且为 `true`
 - `pending`：仅当任务已创建但 worker 还未进入运行态时返回且为 `true`
 - `stale`：仅当数据库仍是 `running`，但 worker 进程已经不存在时返回且为 `true`
@@ -516,6 +502,25 @@ python train.py \
 - `result`：任务完成后的精简结果摘要
 - `error`：任务失败时的错误摘要
 - `log_tail`：本地日志尾部
+
+#### `cancel_file_transfer_task`
+终止一个后台文件同步任务。
+
+行为：
+- 如果任务还在运行，会先尝试终止本地 worker 进程组
+- 如果 `SIGTERM` 后仍未退出，会在 `force_kill_after_s` 到期后升级为 `SIGKILL`
+- worker 退出后，数据库里的任务状态会更新为 `cancelled`
+- 如果 worker 在尝试终止后仍存活，工具会返回错误摘要，并保留原状态
+
+参数：`task_id`, `force_kill_after_s`
+
+返回字段：
+- `task_id`
+- `status`：成功取消后为 `cancelled`
+- `terminated`：确实发出了终止信号时返回且为 `true`
+- `force_killed`：升级到 `SIGKILL` 时返回且为 `true`
+- `already_finished`：如果任务本来就已经结束，则返回且为 `true`
+- `error`：取消失败时的错误摘要
 
 #### `sync_remote_to_local`
 远端文件或目录同步到本地（SFTP，增量）。
