@@ -92,6 +92,23 @@ _CHANNEL_OPEN_TIMEOUT = 15.0
 _SFTP_CHANNEL_TIMEOUT = 30.0
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+_INLINE_SYNC_MAX_FILES = max(_env_int("REMOTE_SANDBOX_INLINE_SYNC_MAX_FILES", 10), 1)
+_INLINE_SYNC_MAX_BYTES = max(
+    _env_int("REMOTE_SANDBOX_INLINE_SYNC_MAX_BYTES", 1 * 1024 * 1024),
+    1,
+)
+
+
 # ---------------------------------------------------------------------------
 # Sandbox configuration
 # ---------------------------------------------------------------------------
@@ -2362,6 +2379,78 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _validate_local_sync_request(
+    local_path: str,
+    exclude_file: str | None,
+) -> tuple[Path, str]:
+    local_root = _resolve_local_input_path(local_path)
+    if not local_root.exists():
+        raise ValueError(f"local_path does not exist: {local_root}")
+    if not local_root.is_file() and not local_root.is_dir():
+        raise ValueError(f"local_path must be a file or directory: {local_root}")
+
+    resolved_exclude_file = _resolve_optional_local_file(exclude_file)
+    if resolved_exclude_file and not Path(resolved_exclude_file).is_file():
+        raise ValueError(f"exclude_file must be a file: {resolved_exclude_file}")
+    return local_root, resolved_exclude_file
+
+
+def _estimate_local_sync_workload(
+    *,
+    local_path_arg: str,
+    local_root: Path,
+    exclude_rules: list[str],
+    max_files: int,
+    max_bytes: int,
+) -> dict:
+    summary = {
+        "synced_type": "file" if local_root.is_file() else "directory",
+        "file_count": 0,
+        "total_bytes": 0,
+        "skipped_files": 0,
+        "threshold_exceeded": False,
+    }
+
+    if local_root.is_file():
+        candidates = _single_file_candidates(local_path_arg, local_root)
+        if any(_is_excluded(candidate, exclude_rules) for candidate in candidates):
+            summary["skipped_files"] = 1
+            return summary
+        summary["file_count"] = 1
+        summary["total_bytes"] = local_root.stat().st_size
+        summary["threshold_exceeded"] = (
+            summary["file_count"] > max_files or summary["total_bytes"] > max_bytes
+        )
+        return summary
+
+    for root, dirs, files in os.walk(local_root):
+        rel_root = str(Path(root).relative_to(local_root)).replace("\\", "/")
+        if rel_root == ".":
+            rel_root = ""
+
+        filtered_dirs = []
+        for name in dirs:
+            rel = f"{rel_root}/{name}".strip("/")
+            if _is_excluded(rel, exclude_rules, is_dir=True):
+                continue
+            filtered_dirs.append(name)
+        dirs[:] = filtered_dirs
+
+        for name in files:
+            rel = f"{rel_root}/{name}".strip("/")
+            if _is_excluded(rel, exclude_rules):
+                summary["skipped_files"] += 1
+                continue
+            local_file = Path(root) / name
+            summary["file_count"] += 1
+            summary["total_bytes"] += local_file.stat().st_size
+            if summary["file_count"] > max_files or summary["total_bytes"] > max_bytes:
+                summary["threshold_exceeded"] = True
+                return summary
+
+    return summary
+
+
 def _sync_local_to_remote_impl(
     *,
     local_path: str = ".",
@@ -2607,6 +2696,81 @@ def _run_transfer_worker(task_id: int) -> int:
         return 1
 
 
+def _start_sync_local_to_remote_background(
+    *,
+    local_root: Path,
+    remote_root: str,
+    delete_extras: bool,
+    excludes: list[str] | None,
+    resolved_exclude_file: str,
+    sandbox_name: str,
+    auto_switched: bool = False,
+) -> dict:
+    session = _get_session(sandbox_name)
+    init_watchdog_db(str(watchdog_db_path()))
+    task = create_transfer_task(
+        "local_to_remote",
+        session.id,
+        str(local_root),
+        remote_root,
+        delete_extras=delete_extras,
+        excludes=list(excludes or []),
+        exclude_file=resolved_exclude_file,
+        path=str(watchdog_db_path()),
+    )
+
+    log_file = str(_transfer_log_path(task["id"]))
+    Path(log_file).write_text(
+        (
+            f"== transfer task: {task['id']}\n"
+            f"== created_at: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+            f"== sandbox: {session.id}\n"
+            f"== local_path: {local_root}\n"
+            f"== remote_path: {remote_root}\n"
+        ),
+        encoding="utf-8",
+    )
+    update_transfer_task(
+        task["id"],
+        path=str(watchdog_db_path()),
+        log_file=log_file,
+        progress={
+            "phase": "queued",
+            "current_path": "",
+            "uploaded_dirs": 0,
+            "uploaded_files": 0,
+            "skipped_files": 0,
+            "deleted_dirs": 0,
+            "deleted_files": 0,
+        },
+    )
+    try:
+        proc = _spawn_transfer_worker(task["id"], log_file)
+    except Exception:
+        update_transfer_task(
+            task["id"],
+            path=str(watchdog_db_path()),
+            status="failed",
+            finished_ts=int(time.time()),
+            last_error="Failed to spawn detached transfer worker",
+        )
+        raise
+
+    task = update_transfer_task(
+        task["id"],
+        path=str(watchdog_db_path()),
+        pid=proc.pid,
+    )
+    return _compact_payload({
+        "mode": "background",
+        "auto_switched": True if auto_switched else None,
+        "task_id": task["id"],
+        "status": task["status"],
+        "pid": proc.pid,
+        "log_file": task["log_file"],
+    })
+
+
 # ---------------------------------------------------------------------------
 # MCP tools – file operations (updated to use persistent sessions)
 # ---------------------------------------------------------------------------
@@ -2705,15 +2869,42 @@ def sync_local_to_remote(
     exclude_file: str | None = None,
     sandbox_name: str = "",
 ) -> dict:
-    """Sync local files/directories to the remote sandbox via SFTP."""
-    return _sync_local_to_remote_impl(
+    """Sync local files/directories to the remote sandbox via SFTP.
+
+    Small transfers run inline. Large transfers are automatically delegated to
+    a detached background worker to avoid MCP tool-call timeouts.
+    """
+    local_root, resolved_exclude_file = _validate_local_sync_request(local_path, exclude_file)
+    exclude_rules = _build_exclude_rules(excludes, resolved_exclude_file)
+    workload = _estimate_local_sync_workload(
+        local_path_arg=local_path,
+        local_root=local_root,
+        exclude_rules=exclude_rules,
+        max_files=_INLINE_SYNC_MAX_FILES,
+        max_bytes=_INLINE_SYNC_MAX_BYTES,
+    )
+    remote_root = _normalize_remote(remote_path)
+
+    if workload["threshold_exceeded"]:
+        return _start_sync_local_to_remote_background(
+            local_root=local_root,
+            remote_root=remote_root,
+            delete_extras=delete_extras,
+            excludes=excludes,
+            resolved_exclude_file=resolved_exclude_file,
+            sandbox_name=sandbox_name,
+            auto_switched=True,
+        )
+
+    result = _sync_local_to_remote_impl(
         local_path=local_path,
         remote_path=remote_path,
         delete_extras=delete_extras,
         excludes=excludes,
-        exclude_file=exclude_file,
+        exclude_file=resolved_exclude_file,
         sandbox_name=sandbox_name,
     )
+    return _compact_payload({"mode": "inline", **result})
 
 
 @mcp.tool()
@@ -2726,78 +2917,16 @@ def sync_local_to_remote_background(
     exclude_file: str | None = None,
     sandbox_name: str = "",
 ) -> dict:
-    """Start a local-to-remote sync in a detached local worker process."""
-    local_root = _resolve_local_input_path(local_path)
-    if not local_root.exists():
-        raise ValueError(f"local_path does not exist: {local_root}")
-    if not local_root.is_file() and not local_root.is_dir():
-        raise ValueError(f"local_path must be a file or directory: {local_root}")
-
-    resolved_exclude_file = _resolve_optional_local_file(exclude_file)
-    if resolved_exclude_file and not Path(resolved_exclude_file).is_file():
-        raise ValueError(f"exclude_file must be a file: {resolved_exclude_file}")
-
-    session = _get_session(sandbox_name)
-    init_watchdog_db(str(watchdog_db_path()))
-    task = create_transfer_task(
-        "local_to_remote",
-        session.id,
-        str(local_root),
-        _normalize_remote(remote_path),
+    """Force a local-to-remote sync to run in a detached local worker process."""
+    local_root, resolved_exclude_file = _validate_local_sync_request(local_path, exclude_file)
+    return _start_sync_local_to_remote_background(
+        local_root=local_root,
+        remote_root=_normalize_remote(remote_path),
         delete_extras=delete_extras,
-        excludes=list(excludes or []),
-        exclude_file=resolved_exclude_file,
-        path=str(watchdog_db_path()),
+        excludes=excludes,
+        resolved_exclude_file=resolved_exclude_file,
+        sandbox_name=sandbox_name,
     )
-
-    log_file = str(_transfer_log_path(task["id"]))
-    Path(log_file).write_text(
-        (
-            f"== transfer task: {task['id']}\n"
-            f"== created_at: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-            f"== sandbox: {session.id}\n"
-            f"== local_path: {local_root}\n"
-            f"== remote_path: {_normalize_remote(remote_path)}\n"
-        ),
-        encoding="utf-8",
-    )
-    update_transfer_task(
-        task["id"],
-        path=str(watchdog_db_path()),
-        log_file=log_file,
-        progress={
-            "phase": "queued",
-            "current_path": "",
-            "uploaded_dirs": 0,
-            "uploaded_files": 0,
-            "skipped_files": 0,
-            "deleted_dirs": 0,
-            "deleted_files": 0,
-        },
-    )
-    try:
-        proc = _spawn_transfer_worker(task["id"], log_file)
-    except Exception:
-        update_transfer_task(
-            task["id"],
-            path=str(watchdog_db_path()),
-            status="failed",
-            finished_ts=int(time.time()),
-            last_error="Failed to spawn detached transfer worker",
-        )
-        raise
-
-    task = update_transfer_task(
-        task["id"],
-        path=str(watchdog_db_path()),
-        pid=proc.pid,
-    )
-    return _compact_payload({
-        "task_id": task["id"],
-        "status": task["status"],
-        "pid": proc.pid,
-        "log_file": task["log_file"],
-    })
 
 
 @mcp.tool()

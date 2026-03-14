@@ -9,6 +9,7 @@
 - **持久 SSH 会话**：每个沙箱维持一条长连接，自动健康检查与断线重连，不再每次调用新建连接
 - **可靠的超时控制**：双层超时（远端 `timeout` 命令 + 客户端 deadline）确保超时真的生效
 - **后台长任务**：通过 `exec_bash_background` 在 tmux 中运行长任务，默认自动登记 watchdog 并返回 `watch_id`
+- **智能文件传输**：`sync_local_to_remote` 默认只内联处理小传输；超过阈值会自动切到本机后台 worker，避免单次 `tools/call` 卡住。`sync_local_to_remote_background` 仍可显式强制走后台
 - **macOS 守护监控**：本地 `launchd` watchdog 持续监控远端长任务，把状态写入 SQLite，在 SSH 连续失败后发本地通知，并在 tmux 丢失时按 checkpoint/resume 计划恢复
 - 本地文件/目录同步到远程沙箱（增量，按 `size + mtime` 跳过未变更文件）
 - 远程文件/目录同步回本地
@@ -130,6 +131,12 @@ export REMOTE_SANDBOX_LIST='[
 | `key_file` | 二选一 | 私钥文件路径（支持 `~` 展开），支持 Ed25519 / RSA / ECDSA / DSS |
 | `key_passphrase` | 否 | 私钥的加密 passphrase（无加密则留空）|
 
+文件传输阈值相关环境变量：
+| 变量 | 默认值 | 说明 |
+|------|------|------|
+| `REMOTE_SANDBOX_INLINE_SYNC_MAX_FILES` | `200` | `sync_local_to_remote` 允许内联执行的最大文件数，超过则自动切后台 |
+| `REMOTE_SANDBOX_INLINE_SYNC_MAX_BYTES` | `67108864` | `sync_local_to_remote` 允许内联执行的最大字节数，超过则自动切后台 |
+
 ## 5. 启动 MCP Server
 
 ```bash
@@ -230,7 +237,7 @@ export REMOTE_SANDBOX_EXPOSE_ADVANCED_TOOLS=1
 在远端 tmux 中以后台方式运行长任务，立即返回。输出通过 `tee` 写入日志文件，并在末尾追加 `EXIT_CODE=<n>`。
 
 从 `0.6.x` 开始，这是**推荐的长任务入口**：
-- 默认自动登记 watchdog，并返回 `watch_id` / `watch_query_id`
+- 默认自动登记 watchdog，并返回 `watch_id`
 - 在 macOS 上默认自动确保本地 `launchd` watchdog 已安装并启动
 - 如果提供 `checkpoint_*` + `resume_command` / `resume_plan_json`，watchdog 会在 SSH 中断恢复后继续检查，并在 tmux 丢失时按计划恢复
 
@@ -255,6 +262,14 @@ export REMOTE_SANDBOX_EXPOSE_ADVANCED_TOOLS=1
 - `metadata_json` (str, 可选)：附加 JSON 元数据
 - `codex_wakeup` / `codex_command`：为 watchdog 自动生成本地 Codex 事件命令
 
+默认返回字段：
+- `status`：固定为 `started`
+- `tmux_session`
+- `log_file`
+- `sandbox`
+- `watch_id`：仅当 `watch=true` 且登记成功时返回
+- `launch_recovered`：仅当启动命令返回异常，但 tmux 任务看起来已经跑起来时返回
+
 #### `check_background_task`
 查询后台 tmux 任务的运行状态与最新日志。
 
@@ -265,7 +280,13 @@ export REMOTE_SANDBOX_EXPOSE_ADVANCED_TOOLS=1
 - `last_n_lines` (int, 默认 50)：返回日志尾部行数
 - `sandbox_name` (str, 可选)
 
-返回：`tmux_session`、`running`、`exit_code`（任务结束后解析自日志）、`log_tail`、`watch_id`
+返回字段：
+- `tmux_session`
+- `running`
+- `exit_code`：任务结束后解析自日志；运行中通常为空
+- `log_tail`
+- `watch_id`：仅当你按 `watch_id` 查询时返回
+- `error` / `connection_error`：仅当 SSH 检查失败时返回
 
 ---
 
@@ -426,47 +447,75 @@ python train.py \
 所有文件操作工具新增 `sandbox_name` 参数（可选，临时覆盖活跃沙箱）。
 
 #### `list_remote_files`
-列出远程目录内容。参数：`remote_path`, `recursive`, `max_entries`, `sandbox_name`
+列出远程目录内容。
+
+返回字段：
+- `entries`：每项包含 `path`, `is_dir`, `size`, `mtime`
+- `truncated`：达到 `max_entries` 上限时为 `true`
+
+参数：`remote_path`, `recursive`, `max_entries`, `sandbox_name`
 
 #### `read_remote_file`
-读取远程文件。参数：`remote_path`, `max_bytes`, `sandbox_name`
+读取远程文件。
+
+返回字段：
+- `size`
+- `truncated`
+- `content`
+
+参数：`remote_path`, `max_bytes`, `sandbox_name`
 
 #### `sync_local_to_remote`
-这是一个同步型 SFTP 调用：只有整次上传完成后才会返回结果。
+这是默认入口，但它不再等同于“总是同步阻塞上传”。
+
+行为：
+- 小传输才会内联执行，并在整次上传完成后直接返回结果
+- 工具会先扫描本地待传文件数量和总字节数
+- 只要超过以下任一阈值，就会自动切到后台 worker：
+  `REMOTE_SANDBOX_INLINE_SYNC_MAX_FILES`，默认 `200`
+  `REMOTE_SANDBOX_INLINE_SYNC_MAX_BYTES`，默认 `64 MiB`
 
 注意：
-- 如果目录很大、文件很多，或网络 RTT 较高，MCP Client 可能先在 `tools/call` 层超时。
-- 建议配合 `excludes` / `exclude_file` 排除大目录，或按子目录分批同步。
+- 原来的“同步 SFTP 一次传完再返回”模式只适合小文件传输。
+- 如果目录很大、文件很多，或网络 RTT 较高，强行内联很容易被 MCP Client 的 `tools/call` 超时截断。
+- 建议配合 `excludes` / `exclude_file` 排除大目录，减少不必要的扫描和上传。
+
+返回：
+- 小传输：返回 `mode=inline` 和上传摘要
+- 大传输：返回 `mode=background`、`task_id`、`status`、`pid`、`log_file`，并带 `auto_switched=true`
+
 本地文件或目录同步到远端（SFTP，增量）。
 参数：`local_path`, `remote_path`, `delete_extras`, `excludes`, `exclude_file`, `sandbox_name`
 
 #### `sync_local_to_remote_background`
-在本机启动一个脱离 MCP `stdio` 生命周期的后台 worker，执行本地到远端的同步。
+显式强制走后台传输。在本机启动一个脱离 MCP `stdio` 生命周期的后台 worker，执行本地到远端的同步。
 
 适用场景：
-- 目录较大，单次 `tools/call` 容易超过 120 秒
-- 需要轮询状态，而不是阻塞等待整次同步结束
+- 你明确知道这次传输不应该占用一次阻塞式 `tools/call`
+- 需要轮询状态，而不是等待 `sync_local_to_remote` 自动判断
+
+参数：`local_path`, `remote_path`, `delete_extras`, `excludes`, `exclude_file`, `sandbox_name`
 
 返回字段：
 - `task_id`：本次后台同步任务 ID
+- `status`：启动后通常为 `queued`
 - `pid`：本地 worker 进程号
 - `log_file`：本地日志文件路径
-
-参数：`local_path`, `remote_path`, `delete_extras`, `excludes`, `exclude_file`, `sandbox_name`
 
 #### `check_file_transfer_task`
 查询一个后台文件同步任务的状态，并返回本地日志尾部。
 
+参数：`task_id`, `last_n_lines`
+
 返回字段：
 - `status`：`queued` / `running` / `completed` / `failed`
-- `running`：worker 仍在运行时为 `true`
-- `pending`：任务已创建但 worker 还未进入运行态时为 `true`
-- `stale`：数据库仍是 `running`，但 worker 进程已经不存在
+- `running`：仅当 worker 仍在运行时返回且为 `true`
+- `pending`：仅当任务已创建但 worker 还未进入运行态时返回且为 `true`
+- `stale`：仅当数据库仍是 `running`，但 worker 进程已经不存在时返回且为 `true`
 - `progress`：最近一次写入的进度快照
 - `result`：任务完成后的精简结果摘要
+- `error`：任务失败时的错误摘要
 - `log_tail`：本地日志尾部
-
-参数：`task_id`, `last_n_lines`
 
 #### `sync_remote_to_local`
 远端文件或目录同步到本地（SFTP，增量）。
