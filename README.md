@@ -181,6 +181,7 @@ remote-sandbox-mcp
 - 文件操作：`list_remote_files`、`read_remote_file`、`sync_local_to_remote`、`sync_local_to_remote_background`、`check_file_transfer_task`、`sync_remote_to_local`
 
 这样可以把工具列表压到最小，减少 Agent 的上下文负担。
+默认返回也会尽量精简：优先保留状态、ID、关键路径和必要日志，不重复回显输入参数，也不默认附带大块内部对象。
 watchdog 相关的高级运维工具默认**不暴露**；`exec_bash_background()` 会在内部自动使用它们。
 如果你确实需要手动排查/操作 watchdog，再设置环境变量：
 
@@ -264,7 +265,7 @@ export REMOTE_SANDBOX_EXPOSE_ADVANCED_TOOLS=1
 - `last_n_lines` (int, 默认 50)：返回日志尾部行数
 - `sandbox_name` (str, 可选)
 
-返回：`running`（是否仍在运行）、`exit_code`（任务结束后解析自日志）、`log_tail`、`watch_id`
+返回：`tmux_session`、`running`、`exit_code`（任务结束后解析自日志）、`log_tail`、`watch_id`
 
 ---
 
@@ -461,7 +462,8 @@ python train.py \
 - `running`：worker 仍在运行时为 `true`
 - `pending`：任务已创建但 worker 还未进入运行态时为 `true`
 - `stale`：数据库仍是 `running`，但 worker 进程已经不存在
-- `task.progress`：最近一次写入的进度快照
+- `progress`：最近一次写入的进度快照
+- `result`：任务完成后的精简结果摘要
 - `log_tail`：本地日志尾部
 
 参数：`task_id`, `last_n_lines`

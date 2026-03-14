@@ -789,16 +789,15 @@ def _exec_on_channel(
                 if time.monotonic() > deadline:
                     channel.close()
                     out = b"".join(stdout_buf).decode("utf-8", errors="replace")
-                    return {
+                    return _compact_payload({
                         "exit_code": -1,
                         "stdout": out[-max_output_chars:] if len(out) > max_output_chars else out,
                         "stderr": (
                             f"[TIMEOUT] Client-side deadline exceeded after {timeout_s}s. "
                             "The remote process may still be running."
                         ),
-                        "command": command,
                         "timed_out": True,
-                    }
+                    })
 
                 if channel.recv_ready():
                     data = channel.recv(65536)
@@ -838,13 +837,12 @@ def _exec_on_channel(
 
             out = b"".join(stdout_buf).decode("utf-8", errors="replace")
             err = b"".join(stderr_buf).decode("utf-8", errors="replace")
-            return {
+            return _compact_payload({
                 "exit_code": -1,
                 "stdout": out[-max_output_chars:] if len(out) > max_output_chars else out,
                 "stderr": (err + f"\n[CONNECTION ERROR] {exc}").strip(),
-                "command": command,
                 "connection_error": True,
-            }
+            })
         finally:
             if channel is not None:
                 try:
@@ -864,7 +862,6 @@ def _exec_on_channel(
             "exit_code": exit_code,
             "stdout": out_text,
             "stderr": err_text,
-            "command": command,
         }
         if exit_code == 124:
             result["timed_out"] = True
@@ -872,7 +869,7 @@ def _exec_on_channel(
                 result["stderr"]
                 + f"\n[TIMEOUT] Remote process killed by timeout after {timeout_s}s"
             ).strip()
-        return result
+        return _compact_payload(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1214,65 @@ def _single_file_candidates(path_arg: str, abs_path: Path) -> list[str]:
     return deduped
 
 
+def _compact_payload(value):
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            compacted = _compact_payload(item)
+            if compacted is None:
+                continue
+            if compacted == "":
+                continue
+            if isinstance(compacted, (dict, list)) and not compacted:
+                continue
+            result[key] = compacted
+        return result
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            compacted = _compact_payload(item)
+            if compacted is None:
+                continue
+            if compacted == "":
+                continue
+            if isinstance(compacted, (dict, list)) and not compacted:
+                continue
+            result.append(compacted)
+        return result
+    return value
+
+
+def _summarize_transfer_progress(progress: dict | None) -> dict:
+    if not isinstance(progress, dict):
+        return {}
+    summary: dict = {}
+    synced_type = str(progress.get("synced_type", "")).strip()
+    if synced_type:
+        summary["synced_type"] = synced_type
+    phase = str(progress.get("phase", "")).strip()
+    if phase:
+        summary["phase"] = phase
+    current_path = str(progress.get("current_path", "")).strip()
+    if current_path:
+        summary["current_path"] = current_path
+    duration = progress.get("duration_s")
+    if isinstance(duration, (int, float)) and duration > 0:
+        summary["duration_s"] = duration
+    for key in (
+        "uploaded_dirs",
+        "uploaded_files",
+        "skipped_files",
+        "deleted_dirs",
+        "deleted_files",
+        "created_dirs",
+        "downloaded_files",
+    ):
+        value = progress.get(key)
+        if isinstance(value, int) and value > 0:
+            summary[key] = value
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # MCP tools – sandbox management
 # ---------------------------------------------------------------------------
@@ -1508,7 +1564,7 @@ def exec_bash_background(
                     "or permission denied on the log directory."
                 )
 
-            return {
+            return _compact_payload({
                 "error": "Failed to start background task in tmux",
                 "diagnosis": diagnosis,
                 "stderr": stderr,
@@ -1516,8 +1572,7 @@ def exec_bash_background(
                 "exit_code": result["exit_code"],
                 "timed_out": result.get("timed_out", False),
                 "connection_error": result.get("connection_error", False),
-                "launch_check": launch_check,
-            }
+            })
     task = {
         "status": "started",
         "tmux_session": tmux_session_name,
@@ -1526,36 +1581,18 @@ def exec_bash_background(
     }
     if launch_recovered:
         task["launch_recovered"] = True
-        task["launch_check"] = launch_check
-        task["note"] = (
-            "Task appears to have started even though the launch command did not return cleanly. "
-            "Call check_background_task to poll progress."
-        )
-    else:
-        task["note"] = (
-            "Task is running in background. "
-            "Call check_background_task with this tmux_session and log_file to poll progress."
-        )
     if not watch:
-        return task
+        return _compact_payload(task)
 
-    watchdog_setup = None
     if ensure_watchdog:
         if sys.platform == "darwin":
-            watchdog_setup = _ensure_watchdog_ready(
+            _ensure_watchdog_ready(
                 persist_current_sandboxes=True,
                 start_now=True,
             )
         else:
             init_watchdog_db()
             _persist_current_sandboxes()
-            watchdog_setup = {
-                "warning": (
-                    "ensure_watchdog=True requested outside macOS; the watch was still "
-                    "registered in SQLite, but launchd auto-start is unavailable."
-                ),
-                "status": _watchdog_status_payload(),
-            }
     else:
         init_watchdog_db()
         _persist_current_sandboxes()
@@ -1589,21 +1626,12 @@ def exec_bash_background(
         alert_after_failures=alert_after_failures,
         resume_delay_s=resume_delay_s,
     )
-    task["watchdog_setup"] = watchdog_setup
-    task["event_command"] = effective_event_command
     if isinstance(watch_result, dict) and watch_result.get("watch"):
         watch_payload = watch_result["watch"]
-        task["watch"] = watch_payload
         task["watch_id"] = watch_payload["id"]
-        task["watch_query_id"] = watch_payload["id"]
-        task["note"] = (
-            "Task is running in background. "
-            f"Call check_background_task(watch_id={watch_payload['id']}) to poll progress."
-        )
-        return task
+        return _compact_payload(task)
 
-    task["watch"] = watch_result
-    return task
+    return _compact_payload(task)
 
 
 @mcp.tool()
@@ -1655,15 +1683,12 @@ def check_background_task(
     )
     status_result = _exec_on_channel(client, check_cmd, timeout_s=10, max_output_chars=200)
     if status_result.get("connection_error"):
-        return {
+        return _compact_payload({
             "error": status_result.get("stderr", "").strip() or "SSH connection failed",
             "connection_error": True,
             "tmux_session": resolved_tmux_session,
-            "log_file": resolved_log_file,
-            "sandbox": session.id,
             "watch_id": watch_id if watch_id > 0 else None,
-            "watch": resolved_watch,
-        }
+        })
     is_running = "RUNNING" in status_result.get("stdout", "")
 
     log_tail = ""
@@ -1676,15 +1701,12 @@ def check_background_task(
         )
         log_result = _exec_on_channel(client, tail_cmd, timeout_s=15, max_output_chars=20000)
         if log_result.get("connection_error"):
-            return {
+            return _compact_payload({
                 "error": log_result.get("stderr", "").strip() or "SSH connection failed",
                 "connection_error": True,
                 "tmux_session": resolved_tmux_session,
-                "log_file": resolved_log_file,
-                "sandbox": session.id,
                 "watch_id": watch_id if watch_id > 0 else None,
-                "watch": resolved_watch,
-            }
+            })
         log_tail = log_result.get("stdout", "")
 
         # Try to extract EXIT_CODE from the log
@@ -1696,16 +1718,13 @@ def check_background_task(
                     pass
                 break
 
-    return {
+    return _compact_payload({
         "tmux_session": resolved_tmux_session,
         "running": is_running,
-        "log_file": resolved_log_file,
         "log_tail": log_tail,
         "exit_code": parsed_exit_code,
-        "sandbox": session.id,
         "watch_id": watch_id if watch_id > 0 else None,
-        "watch": resolved_watch,
-    }
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -2621,11 +2640,9 @@ def list_remote_files(
                 entries.append(
                     {
                         "path": full,
-                        "name": item.filename,
                         "is_dir": is_dir,
                         "size": item.st_size,
                         "mtime": int(item.st_mtime),
-                        "mode": item.st_mode,
                     }
                 )
                 if len(entries) >= max_entries:
@@ -2634,12 +2651,12 @@ def list_remote_files(
                     walk(full)
 
         walk(remote_path)
-        return {
-            "remote_path": remote_path,
-            "recursive": recursive,
-            "truncated": len(entries) >= max_entries,
-            "entries": entries,
-        }
+        return _compact_payload(
+            {
+                "truncated": len(entries) >= max_entries,
+                "entries": entries,
+            }
+        )
     finally:
         sftp.close()
 
@@ -2667,12 +2684,13 @@ def read_remote_file(
         truncated = len(data) > max_bytes
         if truncated:
             data = data[:max_bytes]
-        return {
-            "remote_path": remote_path,
-            "size": len(data),
-            "truncated": truncated,
-            "content": data.decode("utf-8", errors="replace"),
-        }
+        return _compact_payload(
+            {
+                "size": len(data),
+                "truncated": truncated,
+                "content": data.decode("utf-8", errors="replace"),
+            }
+        )
     finally:
         sftp.close()
 
@@ -2774,19 +2792,12 @@ def sync_local_to_remote_background(
         path=str(watchdog_db_path()),
         pid=proc.pid,
     )
-    return {
+    return _compact_payload({
         "task_id": task["id"],
         "status": task["status"],
         "pid": proc.pid,
-        "sandbox": task["sandbox_name"],
-        "local_path": task["local_path"],
-        "remote_path": task["remote_path"],
         "log_file": task["log_file"],
-        "note": (
-            "Transfer worker started in background. "
-            f"Call check_file_transfer_task(task_id={task['id']}) to poll progress."
-        ),
-    }
+    })
 
 
 @mcp.tool()
@@ -2807,16 +2818,18 @@ def check_file_transfer_task(task_id: int, last_n_lines: int = 50) -> dict:
     worker_alive = _pid_is_alive(pid) if pid > 0 else False
     status = task.get("status", "")
     stale = status == "running" and pid > 0 and not worker_alive and not task.get("finished_ts")
-    return {
+    payload = {
         "task_id": task_id,
         "status": status,
-        "running": status == "running" and worker_alive,
-        "pending": status == "queued",
-        "worker_alive": worker_alive if pid > 0 else None,
-        "stale": stale,
-        "task": task,
+        "running": True if status == "running" and worker_alive else None,
+        "pending": True if status == "queued" else None,
+        "stale": True if stale else None,
+        "progress": _summarize_transfer_progress(task.get("progress")),
+        "result": _summarize_transfer_progress(task.get("result")),
+        "error": task.get("last_error", "") if status == "failed" else "",
         "log_tail": _tail_local_file(task.get("log_file", ""), last_n_lines=last_n_lines),
     }
+    return _compact_payload(payload)
 
 
 @mcp.tool()
