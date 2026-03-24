@@ -901,6 +901,10 @@ def _normalize_remote(path: str) -> str:
     return posixpath.normpath(path)
 
 
+def _resolve_remote_input_path(session: SandboxSession, path: str) -> str:
+    return _normalize_remote(_expand_remote_user_path(session, path))
+
+
 def _normalize_pattern(pattern: str) -> str:
     normalized = pattern.strip().replace("\\", "/")
     if not normalized:
@@ -2516,7 +2520,8 @@ def _sync_local_to_remote_impl(
     if not local_root.exists():
         raise ValueError(f"local_path does not exist: {local_root}")
 
-    remote_root = _normalize_remote(remote_path)
+    session = _get_session(sandbox_name)
+    remote_root = _resolve_remote_input_path(session, remote_path)
     exclude_rules = _build_exclude_rules(excludes, exclude_file)
     start = time.time()
 
@@ -2533,7 +2538,6 @@ def _sync_local_to_remote_impl(
             }
         )
 
-    session = _get_session(sandbox_name)
     client = session.ensure_connected()
     sftp = _open_sftp_client(client)
     try:
@@ -2842,8 +2846,8 @@ def list_remote_files(
     if max_entries <= 0:
         raise ValueError("max_entries must be positive")
 
-    remote_path = _normalize_remote(remote_path)
     session = _get_session(sandbox_name)
+    remote_path = _resolve_remote_input_path(session, remote_path)
     client = session.ensure_connected()
     sftp = _open_sftp_client(client)
     try:
@@ -2892,8 +2896,8 @@ def read_remote_file(
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
 
-    remote_path = _normalize_remote(remote_path)
     session = _get_session(sandbox_name)
+    remote_path = _resolve_remote_input_path(session, remote_path)
     client = session.ensure_connected()
     sftp = _open_sftp_client(client)
     try:
@@ -2937,7 +2941,8 @@ def sync_local_to_remote(
         max_files=_INLINE_SYNC_MAX_FILES,
         max_bytes=_INLINE_SYNC_MAX_BYTES,
     )
-    remote_root = _normalize_remote(remote_path)
+    session = _get_session(sandbox_name)
+    remote_root = _resolve_remote_input_path(session, remote_path)
 
     if workload["threshold_exceeded"]:
         return _start_sync_local_to_remote_background(
@@ -2952,7 +2957,7 @@ def sync_local_to_remote(
 
     result = _sync_local_to_remote_impl(
         local_path=local_path,
-        remote_path=remote_path,
+        remote_path=remote_root,
         delete_extras=delete_extras,
         excludes=excludes,
         exclude_file=resolved_exclude_file,
@@ -2973,9 +2978,10 @@ def sync_local_to_remote_background(
 ) -> dict:
     """Force a local-to-remote sync to run in a detached local worker process."""
     local_root, resolved_exclude_file = _validate_local_sync_request(local_path, exclude_file)
+    session = _get_session(sandbox_name)
     return _start_sync_local_to_remote_background(
         local_root=local_root,
-        remote_root=_normalize_remote(remote_path),
+        remote_root=_resolve_remote_input_path(session, remote_path),
         delete_extras=delete_extras,
         excludes=excludes,
         resolved_exclude_file=resolved_exclude_file,
@@ -3092,12 +3098,12 @@ def sync_remote_to_local(
     sandbox_name: str = "",
 ) -> dict:
     """Download remote sandbox files/directories to local path via SFTP."""
-    remote_root = _normalize_remote(remote_path)
     local_root = Path(local_path).resolve()
     exclude_rules = _build_exclude_rules(excludes, exclude_file)
 
     start = time.time()
     session = _get_session(sandbox_name)
+    remote_root = _resolve_remote_input_path(session, remote_path)
     client = session.ensure_connected()
     sftp = _open_sftp_client(client)
     try:
